@@ -136,77 +136,73 @@ class CWClass():
         fileHandle = open(file_name,"r" )
         lineList = fileHandle.readlines()
         fileHandle.close()
-        header_lines = 0
-        last_line_of_header = 0
-        for i in range(min(len(lineList),1000)):
-            if "#" in lineList[i]:
-                last_line_of_header = i+1
-        # Determine number of columns from a line near the end of the file. Scan backward
-        # (skipping the very last line, which may still be mid-write) for one that matches
-        # a known-good format, rather than trusting a single line — a file being actively
-        # appended to (especially on a cloud-synced folder like Google Drive) can carry an
-        # occasional short/malformed row without the rest of the recording being invalid.
-        # Recorded lines end with a trailing tab before the newline, which would otherwise
-        # split into a spurious extra (empty/"\n") column here.
-        number_of_columns = 0
-        scan_start = len(lineList) - 2
-        for i in range(scan_start, max(scan_start - 200, -1), -1):
-            n = len(lineList[i].rstrip('\t\n').split("\t"))
-            if n in (10, 13):
-                number_of_columns = n
-                break
-        if number_of_columns == 0:
-            number_of_columns = len(lineList[scan_start].rstrip('\t\n').split("\t"))
-        column_array = range(0,number_of_columns)
-
-
-        def split_xyz(str_array):
-            """Split 'X:Y:Z' strings (accel/gyro columns) into three float arrays."""
-            x, y, z = [], [], []
-            for s in str_array:
-                parts = s.split(':')
-                x.append(parts[0])
-                y.append(parts[1])
-                z.append(parts[2])
-            return np.asarray(x).astype(float), np.asarray(y).astype(float), np.asarray(z).astype(float)
+        # Sensor columns are optional and deliberately ignored. Supported layouts:
+        # 6/9 columns contain only event data (9 also has name, time and date);
+        # 10/13 are legacy files containing the four unused sensor fields.
+        supported_columns = (6, 9, 10, 13)
+        column_counts = []
+        for line in lineList[-200:]:
+            stripped = line.rstrip('\t\r\n')
+            if stripped and not stripped.lstrip().startswith('#'):
+                n_columns = len(stripped.split('\t'))
+                if n_columns in supported_columns:
+                    column_counts.append(n_columns)
+        if not column_counts:
+            msg = "No valid event rows found in file"
+            self.feed_box.append(msg)
+            raise ValueError(msg)
+        number_of_columns = max(set(column_counts), key=column_counts.count)
 
         file_from_computer = False
         file_from_sdcard   = False
-        if number_of_columns == 13:
+        if number_of_columns in (9, 13):
             file_from_computer = True
-            data = np.genfromtxt(file_name, dtype = str, delimiter='\t', usecols=column_array, invalid_raise=False, skip_header=header_lines)
+            metadata_columns = (6, 7, 8) if number_of_columns == 9 else (10, 11, 12)
+            data = np.genfromtxt(
+                file_name, dtype=str, delimiter='\t', comments='#',
+                usecols=(0, 1, 2, 3, 4, 5, *metadata_columns), invalid_raise=False
+            )
+            data = np.atleast_2d(data)
             event_number = data[:,0].astype(float) #first column of data
             PICO_timestamp_s = data[:,1].astype(float)
             coincident = np.array([s.strip() not in ('0', 'False', 'false', '') for s in data[:,2]])
             adc = data[:,3].astype(int)
             sipm = data[:,4].astype(float)
             deadtime = data[:,5].astype(float)
-            temperature = data[:,6].astype(float)
-            pressure = data[:,7].astype(float)
-            accel_x, accel_y, accel_z = split_xyz(data[:,8].astype(str))
-            gyro_x, gyro_y, gyro_z = split_xyz(data[:,9].astype(str))
-            detName = data[:,10]
-            comp_time = data[:,11]
-            comp_date = data[:,12]
+            detName = data[:,6]
+            comp_time = data[:,7]
+            comp_date = data[:,8]
 
-        elif number_of_columns == 10:
+        elif number_of_columns in (6, 10):
             file_from_sdcard = True
             self.feed_box.append('File from MicroSD Card')
-            data = np.genfromtxt(file_name, dtype = str, delimiter='\t', usecols=column_array, invalid_raise=False, skip_header=header_lines)
+            data = np.genfromtxt(
+                file_name, dtype=str, delimiter='\t', comments='#',
+                usecols=(0, 1, 2, 3, 4, 5), invalid_raise=False
+            )
+            data = np.atleast_2d(data)
             event_number = data[:,0].astype(float)#first column of data
             PICO_timestamp_s = data[:,1].astype(float)
             coincident = np.array([s.strip() not in ('0', 'False', 'false', '') for s in data[:,2]])
             adc = data[:,3].astype(int)
             sipm = data[:,4].astype(float)
             deadtime = data[:,5].astype(float)
-            temperature = data[:,6].astype(float)
-            pressure = data[:,7].astype(float)
-            accel_x, accel_y, accel_z = split_xyz(data[:,8].astype(str))
-            gyro_x, gyro_y, gyro_z = split_xyz(data[:,9].astype(str))
         else:
             msg = f"Incorrect number of columns in file: {number_of_columns}"
             self.feed_box.append(msg)
             raise ValueError(msg)
+
+        # Correctly-sized placeholders keep ADC filtering and event plots independent
+        # from sensor availability.
+        sensor_placeholder = np.zeros(len(event_number), dtype=float)
+        temperature = sensor_placeholder.copy()
+        pressure = sensor_placeholder.copy()
+        accel_x = sensor_placeholder.copy()
+        accel_y = sensor_placeholder.copy()
+        accel_z = sensor_placeholder.copy()
+        gyro_x = sensor_placeholder.copy()
+        gyro_y = sensor_placeholder.copy()
+        gyro_z = sensor_placeholder.copy()
 
         if adc_min > 0 or adc_max < 4095:
             adc_mask = (np.asarray(adc) >= adc_min) & (np.asarray(adc) <= adc_max)
@@ -973,19 +969,29 @@ class FuturisticDashboard(QWidget):
 
         self.static_canvas.mpl_connect("motion_notify_event", update_coords)
 
-        # --- Optional: style toolbar buttons ---
+        # Matplotlib creates light icons for the dark dashboard. Keep a dark button
+        # background so Home/Pan/Zoom/Save remain visible instead of white-on-white.
         self.toolbar.setStyleSheet("""
-            QToolBar { border-radius: 8px; }
+            QToolBar {
+                background: transparent;
+                border: none;
+                spacing: 3px;
+            }
             QToolButton {
-                background-color: white;
-                border: 2px solid black;
-                border-radius: 8px;
+                background-color: #122c3d;
+                border: 1px solid white;
+                border-radius: 6px;
                 color: white;
+                padding: 4px;
+                margin: 1px;
             }
-            QToolButton:pressed {
-                background-color: grey;
+            QToolButton:hover {
+                background-color: #24445d;
             }
-
+            QToolButton:pressed, QToolButton:checked {
+                background-color: #007f8c;
+                border: 1px solid #00ffff;
+            }
         """)
 
         
@@ -1010,7 +1016,7 @@ class FuturisticDashboard(QWidget):
         #Bottom buttons
         scan_btns = QHBoxLayout()
 
-        # Temperature button
+        # Event-rate button
         self.rate_btn = QPushButton("Rate")
         self.rate_btn.clicked.connect(lambda: self._plot_or_correlate(
             'Coincident Rate [Hz]',
@@ -1031,36 +1037,6 @@ class FuturisticDashboard(QWidget):
             'SiPM [mV]', lambda: [(self.cw.sipm, mycolors[7], 'All Events')],
             self.run_voltage, 'per_event', self.SiPM_btn))
         scan_btns.addWidget(self.SiPM_btn)
-
-        # Pressure button
-        self.pressure_btn = QPushButton("Pressure")
-        self.pressure_btn.clicked.connect(lambda: self._plot_or_correlate(
-            'Pressure [Pa]', lambda: [(self.cw.binned_pressure, mycolors[6], 'Pressure')],
-            self.run_pressure, 'binned', self.pressure_btn))
-        scan_btns.addWidget(self.pressure_btn)
-
-        # Temperature button
-        self.temperature_btn = QPushButton("Temperature")
-        self.temperature_btn.clicked.connect(lambda: self._plot_or_correlate(
-            'Temperature [C]', lambda: [(self.cw.binned_temperature, mycolors[5], 'Temperature')],
-            self.run_temperature, 'binned', self.temperature_btn))
-        scan_btns.addWidget(self.temperature_btn)
-
-        # Linear Acceleration button
-        self.acc_btn = QPushButton("Linear Acceleration")
-        self.acc_btn.clicked.connect(lambda: self._plot_or_correlate(
-            'Accel magnitude [g]',
-            lambda: [(np.sqrt(self.cw.binned_accel_x**2 + self.cw.binned_accel_y**2 + self.cw.binned_accel_z**2), mycolors[2], 'Accel')],
-            self.run_acc, 'binned', self.acc_btn))
-        scan_btns.addWidget(self.acc_btn)
-
-        # Angular Velocity button
-        self.gyro_btn = QPushButton("Angular velocity")
-        self.gyro_btn.clicked.connect(lambda: self._plot_or_correlate(
-            'Gyro magnitude [deg/s]',
-            lambda: [(np.sqrt(self.cw.binned_gyro_x**2 + self.cw.binned_gyro_y**2 + self.cw.binned_gyro_z**2), mycolors[2], 'Gyro')],
-            self.run_gyro, 'binned', self.gyro_btn))
-        scan_btns.addWidget(self.gyro_btn)
 
         self.deadtime_btn = QPushButton("Deadtime")
         self.deadtime_btn.clicked.connect(lambda: self._plot_or_correlate(
@@ -1353,11 +1329,40 @@ class FuturisticDashboard(QWidget):
             }}
         """
 
-        for btn in [self.rate_btn, self.adc_btn, self.pressure_btn,
-            self.temperature_btn, self.acc_btn, self.gyro_btn, self.SiPM_btn,
+        for btn in [self.rate_btn, self.adc_btn, self.SiPM_btn,
             self.deadtime_btn, self.rate_dist_btn, self.interevent_btn,
             self.adc_update_btn, self.adc_max_update_btn]:
             btn.setStyleSheet(button_style)
+
+        # The navigation icons are generated as light icons at toolbar creation time,
+        # therefore their buttons deliberately stay dark in both application themes.
+        self.toolbar.setStyleSheet(f"""
+            QToolBar {{
+                background: transparent;
+                border: none;
+                spacing: 3px;
+            }}
+            QToolButton {{
+                background-color: {t['button_background']};
+                border: 1px solid {t['button_border']};
+                border-radius: 6px;
+                color: white;
+                padding: 4px;
+                margin: 1px;
+            }}
+            QToolButton:hover {{
+                background-color: #24445d;
+                border: 1px solid {t['button_border']};
+            }}
+            QToolButton:pressed, QToolButton:checked {{
+                background-color: #007f8c;
+                border: 1px solid #00ffff;
+            }}
+            QToolButton:disabled {{
+                background-color: #263746;
+                border: 1px solid #66717a;
+            }}
+        """)
         # Re-apply cyan to the active plot button and any pending correlation selection
         active = getattr(self, '_active_plot_btn', None)
         if active:
@@ -1474,7 +1479,7 @@ class FuturisticDashboard(QWidget):
 
 
     def _status_html(self, run_time_s, deadtime_s, live_time_s, events, rate, rate_err,
-                      coincidences, coinc_rate, coinc_rate_err, avg_temp, avg_pressure):
+                      coincidences, coinc_rate, coinc_rate_err):
         """Build the summary-statistics table, shared by the loaded-file view and the live serial view."""
         def row(label, value):
             return f"<tr><td>{label}</td><td align='right' nowrap>{value}</td></tr>"
@@ -1488,9 +1493,6 @@ class FuturisticDashboard(QWidget):
             + row("Rate:",        f"{rate:,.4f} ± {rate_err:,.4f} Hz")
             + row("Coincidences:", f"{coincidences:,.0f}")
             + row("Rate:",        f"{coinc_rate:,.4f} ± {coinc_rate_err:,.4f} Hz")
-            + "<tr><td colspan='2'>&nbsp;</td></tr>"
-            + row("Avg Temperature:", f"{avg_temp:,.2f} °C")
-            + row("Avg Pressure:",    f"{avg_pressure:,.0f} Pa")
             + "</table>"
         )
 
@@ -1500,7 +1502,6 @@ class FuturisticDashboard(QWidget):
             self.cw.PICO_total_time_s, self.cw.total_deadtime_s, self.cw.live_time_s,
             self.cw.total_counts, self.cw.count_rate, self.cw.count_rate_err,
             self.cw.total_coincident, self.cw.count_rate_coincident, self.cw.count_rate_err_coincident,
-            np.mean(self.cw.temperature), np.mean(self.cw.pressure),
         )
         self.data_ready2.emit(html)
 
@@ -2384,7 +2385,7 @@ class FuturisticDashboard(QWidget):
         "###########################################################################################################################################################",
         "#                                                          CosmicWatch: The Desktop Muon Detector v3X",
         "#                                                                   Questions? saxani@udel.edu",
-        "# Event  Timestamp[s]  Coincident[bool]  ADC[0-4095]  SiPM[mV]  Deadtime[s]  Temp[C]  Pressure[Pa]  Accel(X:Y:Z)[g]  Gyro(X:Y:Z)[deg/sec]  Name  Time  Date",
+        "# Event  Timestamp[s]  Coincident[bool]  ADC[0-4095]  SiPM[mV]  Deadtime[s]  Name  Time  Date",
         "###########################################################################################################################################################"
     ]      
             
@@ -2404,59 +2405,39 @@ class FuturisticDashboard(QWidget):
                 self.rate_error = 0
                 self.coincidence_rate = 0
                 self.coincidence_rate_error = 0
-                temp_sum = 0.0
-                temp_count = 0
-                pressure_sum = 0.0
-                pressure_count = 0
-
                 while self.read_serial_active:
                   try:
                     if self.serial_connection.inWaiting():
-                        raw = self.serial_connection.readline().decode(errors='replace').replace('\r\n','')
-                        data = raw.split("\t")
+                        raw = self.serial_connection.readline().decode(errors='replace').rstrip('\r\n\t')
+                        serial_data = raw.split("\t")
 
-                        # Skip malformed lines (need at least event + timestamp as valid floats)
+                        # The first six columns are the complete event payload used by the GUI.
                         try:
-                            float(data[0]); float(data[1])
+                            float(serial_data[0]); float(serial_data[1])
+                            float(serial_data[3]); float(serial_data[4]); float(serial_data[5])
                         except (ValueError, IndexError):
                             continue
 
-                        if len(data) > 2 and data[2].strip() == '1':
+                        if len(serial_data) > 2 and serial_data[2].strip() == '1':
                             self.coincidence_counter += 1
 
+                        # Current firmware sends 7 fields; legacy firmware sends 11 because
+                        # it includes the four sensor fields. In both cases the last one is
+                        # the detector name. Sensor values are not copied to the saved file.
+                        detector_name = serial_data[-1].strip() if len(serial_data) in (7, 11) else "CosmicWatch"
                         ti = str(datetime.now()).split(" ")
                         comp_time = ti[-1]
-                        data.append(comp_time)
                         comp_date = ti[0].split('-')
-                        data.append(comp_date[2] + '/' + comp_date[1] + '/' + comp_date[0])
-
-                        # Find deadtime column: first plain float after SiPM (col 4),
-                        # skipping accel/gyro (colon-separated) and date (slash-separated)
-                        deadtime_col = 5  # fallback
-                        for _i in range(5, len(data) - 2):
-                            _v = data[_i].strip()
-                            if ':' not in _v and '/' not in _v:
-                                try:
-                                    float(_v)
-                                    deadtime_col = _i
-                                    break
-                                except ValueError:
-                                    pass
+                        date_string = comp_date[2] + '/' + comp_date[1] + '/' + comp_date[0]
+                        data = serial_data[:6] + [detector_name, comp_time, date_string]
+                        deadtime_col = 5
 
                         # Write the complete row in one call so a stats-parsing error below
                         # can never leave a truncated/partial line in the file.
                         self.data_file.write('\t'.join(data) + '\n')
 
                         try:
-                            self.detector_name = data[-3]
-                            if len(data) > 7:
-                                try:
-                                    temp_sum += float(data[6])
-                                    temp_count += 1
-                                    pressure_sum += float(data[7])
-                                    pressure_count += 1
-                                except ValueError:
-                                    pass
+                            self.detector_name = detector_name
                             if self.first_event_time is None:
                                self.first_event_time = float(data[1])
                                self.first_event = float(data[0])
@@ -2471,13 +2452,10 @@ class FuturisticDashboard(QWidget):
                             self.rate_error = math.sqrt(self.rate) / livetime
                             self.coincidence_rate = self.coincidence_counter / livetime
                             self.coincidence_rate_error = math.sqrt(self.coincidence_counter) / livetime
-                            avg_temp = temp_sum / temp_count if temp_count else 0.0
-                            avg_pressure = pressure_sum / pressure_count if pressure_count else 0.0
                             self.data_ready2.emit(self._status_html(
                                 self.time_stamp, deadtime, livetime,
                                 self.events, self.rate, self.rate_error,
                                 self.coincidence_counter, self.coincidence_rate, self.coincidence_rate_error,
-                                avg_temp, avg_pressure,
                             ))
                             self.last_screen_update_time = time.time()
                         except (ValueError, IndexError):
@@ -2489,7 +2467,7 @@ class FuturisticDashboard(QWidget):
                         if event_number % 1 ==0:
                             self.data_file.flush()
     
-                        col_widths = [6, 12, 3, 5, 7, 12, 6, 10, 19, 19, 7, 13, 10]
+                        col_widths = [6, 12, 3, 5, 7, 12, 12, 15, 10]
                         line_str = '  '.join(
                             str(item).strip()[:w].ljust(w)
                             for item, w in zip(data, col_widths)
@@ -2498,13 +2476,10 @@ class FuturisticDashboard(QWidget):
                     else:
                         if time.time() - self.last_screen_update_time >= 1.0:
                             self.time_stamp += 1.0  # increment displayed time by 1 second
-                            avg_temp = temp_sum / temp_count if temp_count else 0.0
-                            avg_pressure = pressure_sum / pressure_count if pressure_count else 0.0
                             self.data_ready2.emit(self._status_html(
                                 self.time_stamp, deadtime, livetime,
                                 self.events, self.rate, self.rate_error,
                                 self.coincidence_counter, self.coincidence_rate, self.coincidence_rate_error,
-                                avg_temp, avg_pressure,
                             ))
                             self.last_screen_update_time = time.time()
                   except OSError:
