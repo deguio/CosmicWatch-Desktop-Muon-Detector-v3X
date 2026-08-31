@@ -16,6 +16,8 @@ import numpy as np
 import math
 import random
 import platform
+import threading
+import queue
 
 # NEW: check for -p flag (print to screen)
 PRINT_TO_SCREEN = ('-p' in sys.argv)
@@ -29,11 +31,50 @@ if PRINT_TO_SCREEN:
 print("========================================================")
 
 
-def signal_handler(signal, frame):
-    print('You pressed Ctrl+C!')
-    ComPort.close()     
-    file.close() 
-    sys.exit(0)
+def current_time_ns():
+    """Return wall-clock time with the best resolution available."""
+    if hasattr(time, 'time_ns'):
+        return time.time_ns()
+    return int(time.time() * 1_000_000_000)
+
+
+def format_pc_timestamp(timestamp_ns):
+    """Convert a nanosecond Unix timestamp to the existing Time/Date columns."""
+    seconds, nanoseconds = divmod(timestamp_ns, 1_000_000_000)
+    timestamp = datetime.fromtimestamp(seconds)
+    # Keep all nine fractional digits reported by time_ns(); plot.py accepts
+    # arbitrary decimal precision in the Time column.
+    comp_time = timestamp.strftime('%H:%M:%S') + '.%09d' % nanoseconds
+    comp_date = timestamp.strftime('%d/%m/%Y')
+    return comp_time, comp_date
+
+
+def build_output_row(raw_bytes, detector_name, timestamp_ns):
+    """Validate one serial event and add its software name and PC timestamp."""
+    raw_data = raw_bytes.decode(errors='replace').rstrip('\r\n\t')
+    serial_data = raw_data.split('\t')
+    try:
+        float(serial_data[0]); float(serial_data[1])
+        float(serial_data[3]); float(serial_data[4]); float(serial_data[5])
+    except (ValueError, IndexError):
+        return None
+
+    comp_time, comp_date = format_pc_timestamp(timestamp_ns)
+    return serial_data[:6] + [detector_name, comp_time, comp_date]
+
+
+def read_detector(detector_index, connection, event_queue, stop_event):
+    """Continuously read one USB device and timestamp each complete line immediately."""
+    while not stop_event.is_set():
+        try:
+            raw_bytes = connection.readline()
+            received_ns = current_time_ns()
+        except (OSError, serial.SerialException) as error:
+            if not stop_event.is_set():
+                event_queue.put(('error', detector_index, error))
+            return
+        if raw_bytes:
+            event_queue.put(('event', detector_index, received_ns, raw_bytes))
 
 def serial_ports():
     if sys.platform.startswith('win'):
@@ -127,11 +168,14 @@ for port, detector_name in zip(port_name_list, detector_name_list):
 
 
 print()
+detectors = []
 for i in range(nDetectors):
     time.sleep(0.1)
     port = port_name_list[i]
     baudrate = 115200
-    globals()['Det%s' % str(i)] = serial.Serial(port,baudrate)
+    # A short timeout lets the reader threads stop promptly on Ctrl+C while each
+    # thread otherwise blocks efficiently waiting for its own USB device.
+    detectors.append(serial.Serial(port, baudrate, timeout=0.1))
     time.sleep(0.1)
 file = open(fname, "w")
 
@@ -165,45 +209,81 @@ file.write("####################################################################
 
 file.write("#                                                          CosmicWatch: The Desktop Muon Detector v3X\n")
 file.write("#                                                                   Questions? saxani@udel.edu\n")
+file.write("# PC timestamp assigned immediately after receipt of each complete serial line\n")
+for port, detector_name in zip(port_name_list, detector_name_list):
+    file.write("# Detector alias: %s = %s\n" % (detector_name, port))
 file.write("# Event  Timestamp[s]  Coincident[bool]  ADC[12b]  SiPM[mV]  Deadtime[s]  Name  Time  Date\n")
 file.write("###########################################################################################################################################################\n")
+file.flush()
 
-while True:
-    for i in range(nDetectors):
-        if globals()['Det%s' % str(i)].inWaiting():
-            
-            raw_data = globals()['Det%s' % str(i)].readline().decode(errors='replace').rstrip('\r\n\t')
-            serial_data = raw_data.split("\t")
+# One dedicated reader per USB device. The main thread only serializes already
+# timestamped rows to disk, so disk I/O never delays timestamp assignment.
+event_queue = queue.Queue()
+stop_event = threading.Event()
+reader_threads = []
+for detector_index, connection in enumerate(detectors):
+    reader = threading.Thread(
+        target=read_detector,
+        args=(detector_index, connection, event_queue, stop_event),
+        name='CosmicWatchReader-%d' % (detector_index + 1),
+        daemon=True,
+    )
+    reader.start()
+    reader_threads.append(reader)
 
-            # A valid event needs the six core fields. Temperature, pressure,
-            # accelerometer, gyroscope and the firmware-provided name are ignored.
-            try:
-                float(serial_data[0]); float(serial_data[1])
-                float(serial_data[3]); float(serial_data[4]); float(serial_data[5])
-            except (ValueError, IndexError):
-                continue
-            
-            ti = str(datetime.now()).split(" ")
-            comp_time = ti[-1]
-            comp_date = ti[0].split('-')
-            date_string = comp_date[2] + '/' + comp_date[1] + '/' + comp_date[0]
+last_flush = time.monotonic()
 
-            # The selected USB port determines the detector identity in the merged file.
-            data = serial_data[:6] + [detector_name_list[i], comp_time, date_string]
-            file.write('\t'.join(data) + '\n')
-            
-            # NEW: optionally also print to screen
-            if PRINT_TO_SCREEN:
-                print('\t'.join(data))
+def write_queued_event(item):
+    if item[0] == 'error':
+        detector_index, error = item[1], item[2]
+        print(
+            'Serial connection lost for %s: %s'
+            % (detector_name_list[detector_index], error),
+            file=sys.stderr,
+        )
+        return
 
-
-            event_number = int(data[0])
-            if event_number % 1 ==0:
-                file.flush() 
+    detector_index, received_ns, raw_bytes = item[1], item[2], item[3]
+    data = build_output_row(
+        raw_bytes, detector_name_list[detector_index], received_ns
+    )
+    if data is None:
+        return
+    line = '\t'.join(data)
+    file.write(line + '\n')
+    if PRINT_TO_SCREEN:
+        print(line)
 
 
-#for i in range(nDetectors):
-globals()['Det%s' % str(0)].close()     
-file.close()  
+try:
+    while True:
+        try:
+            queued_item = event_queue.get(timeout=0.25)
+            write_queued_event(queued_item)
+        except queue.Empty:
+            pass
 
+        # Flushing periodically instead of after every event greatly reduces disk
+        # overhead while limiting unwritten buffered data to about half a second.
+        if time.monotonic() - last_flush >= 0.5:
+            file.flush()
+            last_flush = time.monotonic()
+except KeyboardInterrupt:
+    print('\nStopping acquisition ...')
+finally:
+    stop_event.set()
+    for connection in detectors:
+        connection.close()
+    for reader in reader_threads:
+        reader.join(timeout=1.0)
 
+    # Preserve events that were timestamped just before Ctrl+C.
+    while True:
+        try:
+            write_queued_event(event_queue.get_nowait())
+        except queue.Empty:
+            break
+
+    file.flush()
+    file.close()
+    print('Data file closed: ' + fname)

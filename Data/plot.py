@@ -24,8 +24,8 @@ plt.rcParams["mathtext.fontset"] = "dejavuserif"
 mycolors = ['#c70039','#ff5733','#ff8d1a','#ffc300','#eddd53','#add45c','#57c785',
                '#00baad','#2a7b9b','#3d3d6b','#511849','#900c3f','#900c3f']
 
-def coincidences_from_computer_time(timestamps_s, detector_names, window_ms=10.0):
-    """Mark events from different detectors separated by at most ``window_ms``."""
+def time_coincidence_analysis(timestamps_s, detector_names, window_ms=10.0):
+    """Return the coincident-event mask and number of cross-detector pairs."""
     timestamps_s = np.asarray(timestamps_s, dtype=float)
     detector_names = np.asarray(detector_names, dtype=str)
     if len(timestamps_s) != len(detector_names):
@@ -39,6 +39,7 @@ def coincidences_from_computer_time(timestamps_s, detector_names, window_ms=10.0
 
     window_s = window_ms / 1000.0
     coincident = np.zeros(len(timestamps_s), dtype=bool)
+    pair_count = 0
     order = np.argsort(timestamps_s, kind='mergesort')
     sorted_times = timestamps_s[order]
     sorted_names = detector_names[order]
@@ -51,8 +52,14 @@ def coincidences_from_computer_time(timestamps_s, detector_names, window_ms=10.0
             if sorted_names[candidate] != sorted_names[right]:
                 coincident[order[candidate]] = True
                 coincident[order[right]] = True
+                pair_count += 1
 
-    return coincident
+    return coincident, pair_count
+
+
+def coincidences_from_computer_time(timestamps_s, detector_names, window_ms=10.0):
+    """Mark events from different detectors separated by at most ``window_ms``."""
+    return time_coincidence_analysis(timestamps_s, detector_names, window_ms)[0]
 
 class CWClass():
     def __init__(self, fname, bin_size=60, coincidence_source='device',
@@ -61,6 +68,7 @@ class CWClass():
         self.bin_size = bin_size
         self.coincidence_source = coincidence_source
         self.coincidence_window_ms = coincidence_window_ms
+        self.coincidence_pair_count = None
         if coincidence_source not in ('device', 'time'):
             raise ValueError("coincidence_source must be 'device' or 'time'")
         
@@ -183,7 +191,7 @@ class CWClass():
             self.n_detector       = len(set(detName))
 
             if coincidence_source == 'time':
-                coincident = coincidences_from_computer_time(
+                coincident, self.coincidence_pair_count = time_coincidence_analysis(
                     self.time_stamp_s, detName, coincidence_window_ms
                 )
                 print(
@@ -437,6 +445,29 @@ class CWClass():
         self.live_time_ms = self.live_time_s * 1000.0
         self.analysis_timestamp_s = np.asarray(analysis_timestamp_s)
         self.weights          = np.ones(len(event_number)) / self.live_time_s
+
+        self.detector_count_rates = {}
+        self.coincidence_pair_rate = None
+        self.accidental_pair_rate = None
+        self.corrected_pair_rate = None
+        if self.file_from_computer:
+            detector_names = sorted(set(detName))
+            self.detector_count_rates = {
+                name: np.count_nonzero(detName == name) / self.live_time_s
+                for name in detector_names
+            }
+            if coincidence_source == 'time':
+                self.coincidence_pair_rate = self.coincidence_pair_count / self.live_time_s
+                window_s = coincidence_window_ms / 1000.0
+                self.accidental_pair_rate = sum(
+                    2.0 * self.detector_count_rates[detector_names[i]]
+                    * self.detector_count_rates[detector_names[j]] * window_s
+                    for i in range(len(detector_names))
+                    for j in range(i + 1, len(detector_names))
+                )
+                self.corrected_pair_rate = max(
+                    self.coincidence_pair_rate - self.accidental_pair_rate, 0.0
+                )
 
         n = 4
         print("    -- Total Count Rate: ", np.round(self.total_counts/self.live_time_s,n),"+/-",
@@ -725,7 +756,7 @@ class ratePlot():
                  figsize = [8,8],fontsize = 16, alpha = 0.9,
                  xscale = 'linear',yscale = 'linear',
                  xlabel = '',ylabel = '',
-                 loc = 2, pdf_name='',title = ''):
+                 loc = 2, pdf_name='',title = '', legend_extra=None):
         
         f = plt.figure(figsize=(figsize[0], figsize[1])) 
         ax1 = f.add_subplot(111)
@@ -753,6 +784,9 @@ class ratePlot():
         ax1.tick_params(axis='both', which='major', labelsize=fontsize-3)
         ax1.tick_params(axis='both', which='minor', labelsize=fontsize-3) 
         ax1.xaxis.labelpad = 0 
+
+        for extra_label in legend_extra or []:
+            ax1.plot([], [], linestyle='none', marker='', label=extra_label)
 
         plt.legend(fontsize=fontsize-3,loc = loc,  fancybox = True,frameon=True)
         
@@ -829,6 +863,19 @@ def main():
         pdf_name=pdf_file_location+'/'+infile_name+'_SiPM_peak_voltage.pdf',title = '',)
     
     
+    rate_legend_extra = []
+    if f1.coincidence_source == 'time':
+        rate_legend_extra.extend(
+            '%s rate: %.4f Hz' % (name, rate)
+            for name, rate in f1.detector_count_rates.items()
+        )
+        rate_legend_extra.extend([
+            'Pair rate: %.4f Hz' % f1.coincidence_pair_rate,
+            r'$R_{acc}$ ($\pm$%.3g ms): %.4f Hz'
+            % (f1.coincidence_window_ms, f1.accidental_pair_rate),
+            'Corrected pair rate: %.4f Hz' % f1.corrected_pair_rate,
+        ])
+
     # Plot rate as a function of time
     c = ratePlot(time = [f1.binned_time_m,f1.binned_time_m,f1.binned_time_m],
         count_rates = [f1.binned_count_rate,f1.binned_count_rate_non_coincident,f1.binned_count_rate_coincident],
@@ -841,7 +888,8 @@ def main():
         figsize = [7,5],fmt = ['ko'],
         fontsize = 16,alpha = [1],
         xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = r'Rate [s$^{-1}$]',
-        loc = 1, pdf_name=pdf_file_location+'/'+infile_name+'_rate.pdf',title = '')
+        loc = 1, pdf_name=pdf_file_location+'/'+infile_name+'_rate.pdf',title = '',
+        legend_extra=rate_legend_extra)
 
     
     c = ratePlot(time = [f1.binned_time_m,],
