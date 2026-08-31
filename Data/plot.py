@@ -24,121 +24,139 @@ plt.rcParams["mathtext.fontset"] = "dejavuserif"
 mycolors = ['#c70039','#ff5733','#ff8d1a','#ffc300','#eddd53','#add45c','#57c785',
                '#00baad','#2a7b9b','#3d3d6b','#511849','#900c3f','#900c3f']
 
+def coincidences_from_computer_time(timestamps_s, detector_names, window_ms=10.0):
+    """Mark events from different detectors separated by at most ``window_ms``."""
+    timestamps_s = np.asarray(timestamps_s, dtype=float)
+    detector_names = np.asarray(detector_names, dtype=str)
+    if len(timestamps_s) != len(detector_names):
+        raise ValueError('Timestamps and detector names must have the same length')
+    if window_ms <= 0:
+        raise ValueError('The coincidence window must be greater than zero')
+    if len(set(detector_names)) < 2:
+        raise ValueError(
+            'Time-based coincidences require at least two different detector names'
+        )
+
+    window_s = window_ms / 1000.0
+    coincident = np.zeros(len(timestamps_s), dtype=bool)
+    order = np.argsort(timestamps_s, kind='mergesort')
+    sorted_times = timestamps_s[order]
+    sorted_names = detector_names[order]
+
+    left = 0
+    for right in range(len(order)):
+        while sorted_times[right] - sorted_times[left] > window_s:
+            left += 1
+        for candidate in range(left, right):
+            if sorted_names[candidate] != sorted_names[right]:
+                coincident[order[candidate]] = True
+                coincident[order[right]] = True
+
+    return coincident
+
 class CWClass():
-    def __init__(self,fname, bin_size = 60):
+    def __init__(self, fname, bin_size=60, coincidence_source='device',
+                 coincidence_window_ms=10.0):
         self.name = fname.split('/')[-1]
         self.bin_size = bin_size
+        self.coincidence_source = coincidence_source
+        self.coincidence_window_ms = coincidence_window_ms
+        if coincidence_source not in ('device', 'time'):
+            raise ValueError("coincidence_source must be 'device' or 'time'")
         
         fileHandle = open(fname,"r" )
         lineList = fileHandle.readlines()
         fileHandle.close()
-        header_lines = 0
-        
-        # Look through the first 1000 lines for the word "Device". Everything prior is considered part of the header.
-        last_line_of_header=0
-        for i in range(min(len(lineList),1000)):
-            if "#" in lineList[i]:
-                last_line_of_header = i+1
-  
-        #print(lineList[len(lineList)-2])
-        #Determine number of columns by looking at the second last line in the file.
-        number_of_columns = len(lineList[len(lineList)-2].split("\t"))
-        print('Number of collumns in file: ',number_of_columns)
-        column_array = range(0,number_of_columns)
-        #print(lineList[-1])
+        # Sensor columns are optional. Determine the layout from valid data rows,
+        # ignoring comments, incomplete final rows and trailing tab characters.
+        supported_columns = (6, 9, 10, 13)
+        column_counts = []
+        for line in lineList[-200:]:
+            stripped = line.rstrip('\t\r\n')
+            if stripped and not stripped.lstrip().startswith('#'):
+                n_columns = len(stripped.split('\t'))
+                if n_columns in supported_columns:
+                    column_counts.append(n_columns)
+        if not column_counts:
+            raise ValueError('No valid CosmicWatch event rows found in file')
+
+        number_of_columns = max(set(column_counts), key=column_counts.count)
+        print('Number of columns in file: ', number_of_columns)
 
         self.file_from_computer = False
         self.file_from_sdcard   = False
         self.has_MPU6050 = False
+        self.has_BMP280 = False
         
-        if number_of_columns == 14:
-            self.file_from_computer = True  
-            self.has_MPU6050 = True
-            self.has_BMP280  = True
+        if number_of_columns in (9, 13):
+            self.file_from_computer = True
             print('  -> File from Computer')
-            data = np.genfromtxt(fname, dtype = str, delimiter='\t', usecols=column_array, invalid_raise=False, skip_header=header_lines)
+            metadata_columns = (6, 7, 8) if number_of_columns == 9 else (10, 11, 12)
+            selected_columns = (0, 1, 2, 3, 4, 5, *metadata_columns)
+            data = np.genfromtxt(
+                fname, dtype=str, delimiter='\t', comments='#',
+                usecols=selected_columns, invalid_raise=False
+            )
+            data = np.atleast_2d(data)
             event_number = data[:,0].astype(float) #first column of data
             PICO_timestamp_s = data[:,1].astype(float)
-            coincident = data[:,2].astype(bool)
+            coincident = np.array([
+                value.strip().lower() not in ('0', 'false', '') for value in data[:,2]
+            ])
             adc = data[:,3].astype(int)
             sipm = data[:,4].astype(float)
             deadtime = data[:,5].astype(float)
-            deadtime = deadtime - min(deadtime)
-            temperature = data[:,6].astype(float)
-            pressure = data[:,7].astype(float)
-            accelerometer = data[:,8].astype(str)
-            gyrometer = data[:,9].astype(str)
-            accel_x = []
-            accel_y = []
-            accel_z = []
-            gyro_x = []
-            gyro_y = []
-            gyro_z = []
-            for i in range(len(accelerometer)):
-                accel = accelerometer[i].split(':')
-                accel_x.append(accel[0])
-                accel_y.append(accel[1])
-                accel_z.append(accel[2])
-                gyro = gyrometer[i].split(':')
-                gyro_x.append(gyro[0])
-                gyro_y.append(gyro[1])
-                gyro_z.append(gyro[2])
-            accel_x = np.asarray(accel_x).astype(float)
-            accel_y = np.asarray(accel_y).astype(float)
-            accel_z = np.asarray(accel_z).astype(float)
-            gyro_x = np.asarray(gyro_x).astype(float)
-            gyro_y = np.asarray(gyro_y).astype(float)
-            gyro_z = np.asarray(gyro_z).astype(float)
-
-            detName = data[:,10]
-            comp_time = data[:,11]
-            comp_date = data[:,12]
-            
+            detName = data[:,6]
+            comp_time = data[:,7]
+            comp_date = data[:,8]
         
-        elif number_of_columns == 10:
+        elif number_of_columns in (6, 10):
             print('  -> File from MicroSD Card')
-            self.file_from_sdcard = True 
-            self.has_MPU6050 = True
-            self.has_BMP280  = True
-            
-            data = np.genfromtxt(fname, dtype = str, delimiter='\t', usecols=column_array, invalid_raise=False, skip_header=header_lines)
+            self.file_from_sdcard = True
+            data = np.genfromtxt(
+                fname, dtype=str, delimiter='\t', comments='#',
+                usecols=(0, 1, 2, 3, 4, 5), invalid_raise=False
+            )
+            data = np.atleast_2d(data)
             event_number = data[:,0].astype(float)#first column of data
             PICO_timestamp_s = data[:,1].astype(float)
-            coincident = data[:,2].astype(bool)
+            coincident = np.array([
+                value.strip().lower() not in ('0', 'false', '') for value in data[:,2]
+            ])
             adc = data[:,3].astype(int)
             sipm = data[:,4].astype(float)
             deadtime = data[:,5].astype(float)
-            deadtime = deadtime - min(deadtime)
-            temperature = data[:,6].astype(float)
-            pressure = data[:,7].astype(float)
-            accelerometer = data[:,8].astype(str)
-            gyrometer = data[:,9].astype(str)
-            accel_x = []
-            accel_y = []
-            accel_z = []
-            gyro_x = []
-            gyro_y = []
-            gyro_z = []
-            for i in range(len(accelerometer)):
-                accel = accelerometer[i].split(':')
-                accel_x.append(accel[0])
-                accel_y.append(accel[1])
-                accel_z.append(accel[2])
-                gyro = gyrometer[i].split(':')
-                gyro_x.append(gyro[0])
-                gyro_y.append(gyro[1])
-                gyro_z.append(gyro[2])
-            accel_x = np.asarray(accel_x).astype(float)
-            accel_y = np.asarray(accel_y).astype(float)
-            accel_z = np.asarray(accel_z).astype(float)
-            gyro_x = np.asarray(gyro_x).astype(float)
-            gyro_y = np.asarray(gyro_y).astype(float)
-            gyro_z = np.asarray(gyro_z).astype(float)
-        else: 
-            data = np.genfromtxt(fname, dtype = str, delimiter='\t', usecols=column_array, invalid_raise=False, skip_header=header_lines)
-            print('ERROR: the data should have 10 or 14 collums of data. This file has %1u' %number_of_columns)
-            print('Example of data seen: ')
-            print(data[0])
+
+        deadtime = deadtime - min(deadtime)
+
+        # Defaults for files recorded without environmental or motion sensors.
+        missing_sensor_data = np.full(len(event_number), np.nan, dtype=float)
+        temperature = missing_sensor_data.copy()
+        pressure = missing_sensor_data.copy()
+        accel_x = missing_sensor_data.copy()
+        accel_y = missing_sensor_data.copy()
+        accel_z = missing_sensor_data.copy()
+        gyro_x = missing_sensor_data.copy()
+        gyro_y = missing_sensor_data.copy()
+        gyro_z = missing_sensor_data.copy()
+
+        # Read sensor values only from the two legacy full layouts.
+        if number_of_columns in (10, 13):
+            sensor_data = np.genfromtxt(
+                fname, dtype=str, delimiter='\t', comments='#',
+                usecols=(6, 7, 8, 9), invalid_raise=False
+            )
+            sensor_data = np.atleast_2d(sensor_data)
+            temperature = sensor_data[:,0].astype(float)
+            pressure = sensor_data[:,1].astype(float)
+
+            def split_xyz(values):
+                return np.asarray([value.split(':') for value in values], dtype=float).T
+
+            accel_x, accel_y, accel_z = split_xyz(sensor_data[:,2])
+            gyro_x, gyro_y, gyro_z = split_xyz(sensor_data[:,3])
+            self.has_MPU6050 = True
+            self.has_BMP280 = True
 
         # Convert the computer time to an absolute time (MJD).
         if self.file_from_computer:
@@ -164,9 +182,42 @@ class CWClass():
             self.detector_name    = detName                                
             self.n_detector       = len(set(detName))
 
-        # Convert the cumulative deadtime to the deadtime between events
-        # The detector starts at time 0, so append a zero.
-        event_deadtime_s = np.diff(np.append([0],deadtime))
+            if coincidence_source == 'time':
+                coincident = coincidences_from_computer_time(
+                    self.time_stamp_s, detName, coincidence_window_ms
+                )
+                print(
+                    '  -> Coincidences calculated from computer Date/Time '
+                    'with a %.3f ms window' % coincidence_window_ms
+                )
+
+        elif coincidence_source == 'time':
+            raise ValueError(
+                "Time-based coincidences require a computer file with Name, Time and Date columns"
+            )
+
+        if coincidence_source == 'device':
+            print('  -> Coincidences read from the device flag column')
+
+        # Convert cumulative deadtime separately for every detector. Interleaving
+        # cumulative counters from multiple USB devices would otherwise create
+        # artificial negative deadtimes.
+        event_deadtime_s = np.zeros(len(deadtime), dtype=float)
+        detector_total_deadtimes = []
+        if self.file_from_computer:
+            for detector_name in set(detName):
+                detector_indices = np.where(detName == detector_name)[0]
+                detector_deadtime = deadtime[detector_indices]
+                detector_deltas = np.diff(np.append(detector_deadtime[0], detector_deadtime))
+                event_deadtime_s[detector_indices] = np.maximum(detector_deltas, 0.0)
+                detector_total_deadtimes.append(
+                    max(detector_deadtime) - min(detector_deadtime)
+                )
+        else:
+            event_deadtime_s = np.maximum(
+                np.diff(np.append(deadtime[0], deadtime)), 0.0
+            )
+            detector_total_deadtimes.append(max(deadtime) - min(deadtime))
 
         # The RP Pico absolute time isn't great. Over the course of a few hours, it will be off by several seconds. 
         # The computer will give you accurate time down to about 1ms. Reading from the serial port has ~ms scale uncertainty.
@@ -178,7 +229,7 @@ class CWClass():
         self.PICO_total_time_ms= self.PICO_total_time_s * 1000.
 
         self.event_number     = np.asarray(event_number)  # an arrray of the event numbers
-        self.total_counts     = max(event_number.astype(int)) - min(event_number.astype(int))
+        self.total_counts     = len(event_number)
         self.select_coincident        = coincident         # an arrray of the measured event ADC value
 
         self.adc              = adc         # an arrray of the measured event ADC value
@@ -198,7 +249,9 @@ class CWClass():
         self.event_deadtime_s   = event_deadtime_s    # an array of the measured event deadtime in seconds
         #print(self.event_deadtime_s)
         self.event_deadtime_ms  = self.event_deadtime_s*1000            # an array of the measured event deadtime in miliseconds
-        self.total_deadtime_s   = max(deadtime) - min(deadtime)       # an array of the measured event deadtime in miliseconds
+        # For a merged stream, use the mean detector deadtime against the common
+        # wall-clock duration. This keeps the aggregate rate denominator physical.
+        self.total_deadtime_s   = float(np.mean(detector_total_deadtimes))
         self.total_deadtime_ms  = self.total_deadtime_s*1000. # The total deadtime in seconds
                 
          
@@ -376,9 +429,13 @@ class CWClass():
 
         if self.file_from_computer:
             self.live_time_s        = (self.total_time_s - self.total_deadtime_s)
+            analysis_timestamp_s = self.time_stamp_s
         elif self.file_from_sdcard:
             self.live_time_s        = (self.PICO_total_time_s - self.total_deadtime_s)
-        self.live_time_ms        = (self.PICO_total_time_ms - self.total_deadtime_ms)/1000.
+            analysis_timestamp_s = self.PICO_timestamp_s - min(self.PICO_timestamp_s)
+        self.live_time_s = max(self.live_time_s, np.finfo(float).eps)
+        self.live_time_ms = self.live_time_s * 1000.0
+        self.analysis_timestamp_s = np.asarray(analysis_timestamp_s)
         self.weights          = np.ones(len(event_number)) / self.live_time_s
 
         n = 4
@@ -391,9 +448,25 @@ class CWClass():
         
         
 
-        bins = range(int(min(self.PICO_timestamp_s)),int(max(self.PICO_timestamp_s)),self.bin_size)
-        counts, binEdges = np.histogram(self.PICO_timestamp_s, bins = bins)
-        bin_livetime, binEdges = np.histogram(self.PICO_timestamp_s, bins = bins, weights = self.PICO_event_livetime_s)
+        max_analysis_time = float(max(self.analysis_timestamp_s))
+        if max_analysis_time <= 0:
+            binEdges = np.asarray([0.0, float(self.bin_size)])
+        else:
+            binEdges = np.arange(0.0, max_analysis_time, float(self.bin_size))
+            if len(binEdges) == 0 or binEdges[0] != 0:
+                binEdges = np.insert(binEdges, 0, 0.0)
+            binEdges = np.append(binEdges, max_analysis_time)
+
+        counts, binEdges = np.histogram(self.analysis_timestamp_s, bins=binEdges)
+        bin_deadtime_total, _ = np.histogram(
+            self.analysis_timestamp_s, bins=binEdges, weights=self.event_deadtime_s
+        )
+        detector_count = self.n_detector if self.file_from_computer else 1
+        effective_bin_deadtime = bin_deadtime_total / max(detector_count, 1)
+        bin_widths = np.diff(binEdges)
+        bin_livetime = np.maximum(
+            bin_widths - effective_bin_deadtime, np.finfo(float).eps
+        )
 
         self.bin_size          = bin_size
         self.binned_counts     = counts
@@ -401,10 +474,11 @@ class CWClass():
         self.binned_count_rate = counts/bin_livetime
         self.binned_count_rate_err = np.sqrt(counts)/bin_livetime
 
-        counts_coincident, binEdges      = np.histogram(self.PICO_timestamp_s[self.select_coincident], bins = bins)
-        bin_deadtime, binEdges      = np.histogram(self.PICO_timestamp_s, bins = bins, weights = self.event_deadtime_s)
+        counts_coincident, _ = np.histogram(
+            self.analysis_timestamp_s[self.select_coincident], bins=binEdges
+        )
 
-        self.total_coincident = len(self.PICO_timestamp_s[self.select_coincident])
+        self.total_coincident = int(np.count_nonzero(self.select_coincident))
         
         print("    -- Count Rate Coincident (coincident): ",np.round(self.total_coincident/self.live_time_s,n),"+/-" ,
                     np.round(np.sqrt(self.total_coincident)/self.live_time_s,n),"Hz")
@@ -415,19 +489,20 @@ class CWClass():
         
         
         # Bin the amount of deadtime
-        self.binned_deadtime_percentage = bin_deadtime/bin_size * 100
+        self.binned_deadtime_percentage = effective_bin_deadtime/bin_widths * 100
         self.binned_counts_coincident     = counts_coincident
         self.binned_counts_err_coincident = np.sqrt(counts_coincident)
-        self.binned_count_rate_coincident = counts_coincident/(bin_size-bin_deadtime)
-        self.binned_count_rate_err_coincident = np.sqrt(counts_coincident)/(bin_size-bin_deadtime)
+        self.binned_count_rate_coincident = counts_coincident/bin_livetime
+        self.binned_count_rate_err_coincident = np.sqrt(counts_coincident)/bin_livetime
 
-        counts_non_coincident, binEdges      = np.histogram(self.PICO_timestamp_s[~self.select_coincident], bins = bins)
-        bin_deadtime, binEdges      = np.histogram(self.PICO_timestamp_s, bins = bins, weights = self.event_deadtime_s)
-        self.total_non_coincident = len(self.PICO_timestamp_s[~self.select_coincident])
+        counts_non_coincident, _ = np.histogram(
+            self.analysis_timestamp_s[~self.select_coincident], bins=binEdges
+        )
+        self.total_non_coincident = int(np.count_nonzero(~self.select_coincident))
         self.binned_counts_non_coincident     = counts_non_coincident
         self.binned_counts_err_non_coincident = np.sqrt(counts_non_coincident)
-        self.binned_count_rate_non_coincident = counts_non_coincident/(bin_size-bin_deadtime)
-        self.binned_count_rate_err_non_coincident = np.sqrt(counts_non_coincident)/(bin_size-bin_deadtime)
+        self.binned_count_rate_non_coincident = counts_non_coincident/bin_livetime
+        self.binned_count_rate_err_non_coincident = np.sqrt(counts_non_coincident)/bin_livetime
 
         print("    -- Count Rate Non-Coincident: ",np.round(self.total_non_coincident/self.live_time_s,n),"+/-",
                     np.round(np.sqrt(self.total_non_coincident)/self.live_time_s,n),"Hz")
@@ -436,45 +511,46 @@ class CWClass():
                 self.total_non_coincident/self.live_time_s, 
                 np.sqrt(self.total_non_coincident)/self.live_time_s)
 
-        sum_pressure, _ = np.histogram(self.PICO_timestamp_s, bins=bins, weights=self.pressure)
-        count_pressure, _ = np.histogram(self.PICO_timestamp_s, bins=bins)
-        self.binned_pressure = sum_pressure / np.maximum(count_pressure, 1)  # Avoid division by zero
+        if self.has_BMP280:
+            sum_pressure, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.pressure)
+            count_pressure, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
+            self.binned_pressure = sum_pressure / np.maximum(count_pressure, 1)
 
-        # Bin the temperature by taking the average temperature in each bin
-        sum_temperature, _ = np.histogram(self.PICO_timestamp_s, bins=bins, weights=self.temperature)
-        count_temperature, _ = np.histogram(self.PICO_timestamp_s, bins=bins)
-        self.binned_temperature = sum_temperature / np.maximum(count_temperature, 1)  # Avoid division by zero
+            # Bin the temperature by taking the average temperature in each bin
+            sum_temperature, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.temperature)
+            count_temperature, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
+            self.binned_temperature = sum_temperature / np.maximum(count_temperature, 1)
 
         
         if self.has_MPU6050:
             # Bin the temperature by taking the average temperature in each bin
-            sum_accel_x, _ = np.histogram(self.PICO_timestamp_s, bins=bins, weights=self.accel_x)
-            count_accel_x, _ = np.histogram(self.PICO_timestamp_s, bins=bins)
+            sum_accel_x, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.accel_x)
+            count_accel_x, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
             self.binned_accel_x = sum_accel_x / np.maximum(count_accel_x, 1)  # Avoid division by zero
 
             # Bin the temperature by taking the average temperature in each bin
-            sum_accel_y, _ = np.histogram(self.PICO_timestamp_s, bins=bins, weights=self.accel_y)
-            count_accel_y, _ = np.histogram(self.PICO_timestamp_s, bins=bins)
+            sum_accel_y, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.accel_y)
+            count_accel_y, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
             self.binned_accel_y = sum_accel_y / np.maximum(count_accel_y, 1)  # Avoid division by zero
 
             # Bin the temperature by taking the average temperature in each bin
-            sum_accel_z, _ = np.histogram(self.PICO_timestamp_s, bins=bins, weights=self.accel_z)
-            count_accel_z, _ = np.histogram(self.PICO_timestamp_s, bins=bins)
+            sum_accel_z, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.accel_z)
+            count_accel_z, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
             self.binned_accel_z = sum_accel_z / np.maximum(count_accel_z, 1)  # Avoid division by zero
 
             # Bin the temperature by taking the average temperature in each bin
-            sum_gyro_x, _ = np.histogram(self.PICO_timestamp_s, bins=bins, weights=self.gyro_x)
-            count_gyro_x, _ = np.histogram(self.PICO_timestamp_s, bins=bins)
+            sum_gyro_x, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.gyro_x)
+            count_gyro_x, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
             self.binned_gyro_x = sum_gyro_x / np.maximum(count_gyro_x, 1)  # Avoid division by zero
 
             # Bin the temperature by taking the average temperature in each bin
-            sum_gyro_y, _ = np.histogram(self.PICO_timestamp_s, bins=bins, weights=self.gyro_y)
-            count_gyro_y, _ = np.histogram(self.PICO_timestamp_s, bins=bins)
+            sum_gyro_y, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.gyro_y)
+            count_gyro_y, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
             self.binned_gyro_y = sum_gyro_y / np.maximum(count_gyro_y, 1)  # Avoid division by zero
 
             # Bin the temperature by taking the average temperature in each bin
-            sum_gyro_z, _ = np.histogram(self.PICO_timestamp_s, bins=bins, weights=self.gyro_z)
-            count_gyro_z, _ = np.histogram(self.PICO_timestamp_s, bins=bins)
+            sum_gyro_z, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.gyro_z)
+            count_gyro_z, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
             self.binned_gyro_z = sum_gyro_z / np.maximum(count_gyro_z, 1)  # Avoid division by zero
 
             
@@ -691,6 +767,14 @@ def main():
     parser = argparse.ArgumentParser(description="Process CosmicWatch data.")
     parser.add_argument('-i', '--input', required=True, help="Input file name or full path")
     parser.add_argument('-b', '--bin_width', required=False, help="The width of bins for rate vs time plot in seconds", type=int,default=60)
+    parser.add_argument(
+        '-c', '--coincidence-source', choices=('device', 'time'), default='device',
+        help="Use the device flag or calculate coincidences from computer Time/Date (default: device)"
+    )
+    parser.add_argument(
+        '-w', '--coincidence-window-ms', type=float, default=10.0,
+        help="Time coincidence window in milliseconds when --coincidence-source=time (default: 10)"
+    )
 
     args = parser.parse_args()
 
@@ -712,7 +796,12 @@ def main():
     os.makedirs(pdf_file_location, exist_ok=True)
     
     # Load the data file, set the binsize for the rate as a function of time plot.
-    f1 = CWClass(file_path, bin_size =  args.bin_width)
+    f1 = CWClass(
+        file_path,
+        bin_size=args.bin_width,
+        coincidence_source=args.coincidence_source,
+        coincidence_window_ms=args.coincidence_window_ms,
+    )
 
     
     # Plot the ADC values from the coincident and non-coincident events
@@ -748,7 +837,7 @@ def main():
         labels=[r'All Events: ' + str(f1.count_rate) + '+/-' + str(f1.count_rate_err) +' Hz', 
                 r'Non-Coincident:  ' + str(f1.count_rate_non_coincident) + '+/-' + str(f1.count_rate_err_non_coincident) +' Hz',
                 r'Coincident:  ' + str(f1.count_rate_coincident) + '+/-' + str(f1.count_rate_err_coincident) +' Hz'],
-        xmin = min(f1.PICO_timestamp_s/60), xmax = max(f1.PICO_timestamp_s/60),ymin = 0,ymax = 1.35*max(f1.binned_count_rate),
+        xmin = min(f1.binned_time_m), xmax = max(f1.binned_time_m),ymin = 0,ymax = 1.35*max(f1.binned_count_rate),
         figsize = [7,5],fmt = ['ko'],
         fontsize = 16,alpha = [1],
         xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = r'Rate [s$^{-1}$]',
@@ -766,26 +855,26 @@ def main():
         loc = 2,pdf_name=pdf_file_location+'/'+infile_name+'_deadtime.pdf',title = '')
 
 
-    c = ratePlot(time = [f1.binned_time_m,],
-        count_rates = [f1.binned_pressure],
-        count_rates_err = [np.ones(len(f1.binned_pressure)) * 100], # Uncertainty on pressure is 100 Pa
-        colors =[mycolors[6]],
-        xmin = min(f1.binned_time_m),xmax = max(f1.binned_time_m),ymin = min(f1.binned_pressure)-500,ymax =max(f1.binned_pressure)+500,#min(f1.binned_pressure) -1000
-        figsize = [7,5],labels=['Pressure Data'],
-        fontsize = 16,alpha = [1],fmt = ['ko'],
-        xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = r'Pressure [Pa]',
-        loc = 3,pdf_name=pdf_file_location+'/'+infile_name+'_pressure.pdf',title = '')
+    if f1.has_BMP280:
+        c = ratePlot(time = [f1.binned_time_m,],
+            count_rates = [f1.binned_pressure],
+            count_rates_err = [np.ones(len(f1.binned_pressure)) * 100],
+            colors =[mycolors[6]],
+            xmin = min(f1.binned_time_m),xmax = max(f1.binned_time_m),ymin = min(f1.binned_pressure)-500,ymax =max(f1.binned_pressure)+500,
+            figsize = [7,5],labels=['Pressure Data'],
+            fontsize = 16,alpha = [1],fmt = ['ko'],
+            xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = r'Pressure [Pa]',
+            loc = 3,pdf_name=pdf_file_location+'/'+infile_name+'_pressure.pdf',title = '')
 
-
-    c = ratePlot(time = [f1.binned_time_m,],
-        count_rates = [f1.binned_temperature],
-        count_rates_err = [np.ones(len(f1.binned_temperature))*0.1], # Uncertainty on pressure is 0.1C
-        colors =[mycolors[5]],
-        xmin = min(f1.binned_time_m),xmax = max(f1.binned_time_m),ymin = min(f1.binned_temperature)-0.4,ymax = max(f1.binned_temperature)+0.4,
-        figsize = [7,5],fmt = ['ko'],
-        fontsize = 16,alpha = [1],labels=['Temperature Data'],
-        xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = r'Temperature [$^{\circ}$C]',
-        loc = 3,pdf_name=pdf_file_location+'/'+infile_name+'_temperature.pdf',title = '')
+        c = ratePlot(time = [f1.binned_time_m,],
+            count_rates = [f1.binned_temperature],
+            count_rates_err = [np.ones(len(f1.binned_temperature))*0.1],
+            colors =[mycolors[5]],
+            xmin = min(f1.binned_time_m),xmax = max(f1.binned_time_m),ymin = min(f1.binned_temperature)-0.4,ymax = max(f1.binned_temperature)+0.4,
+            figsize = [7,5],fmt = ['ko'],
+            fontsize = 16,alpha = [1],labels=['Temperature Data'],
+            xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = r'Temperature [$^{\circ}$C]',
+            loc = 3,pdf_name=pdf_file_location+'/'+infile_name+'_temperature.pdf',title = '')
 
     if f1.has_MPU6050:
         c = ratePlot(time = [f1.binned_time_m,f1.binned_time_m,f1.binned_time_m,],
@@ -819,13 +908,15 @@ def main():
     )
     '''
 
+    plot_rows = 1 + (2 if f1.has_BMP280 else 0) + (2 if f1.has_MPU6050 else 0)
     fig, axes = plt.subplots(
-        nrows=5, ncols=1,
+        nrows=plot_rows, ncols=1,
         sharex=True,
-        figsize=(5, 8),
+        figsize=(5, max(3, 1.6 * plot_rows)),
         constrained_layout=True,   # <— replaces tight_layout
         gridspec_kw={'hspace': 0.1}
     )
+    axes = np.atleast_1d(axes)
 
     # 1) Total rate
     axes[0].plot(t, f1.binned_count_rate, color=mycolors[7], label='All Events')
@@ -836,35 +927,37 @@ def main():
     axes[0].grid(True, which='both', linestyle='--', alpha=0.5)
 
 
-    # 3) Pressure
-    axes[1].plot(t, f1.binned_pressure/1000., 'o-', color=mycolors[6])
-    axes[1].set_ylabel('Pressure [kPa]')
-    axes[1].grid(True, which='both', linestyle='--', alpha=0.5)
+    axis_index = 1
+    if f1.has_BMP280:
+        axes[axis_index].plot(t, f1.binned_pressure/1000., 'o-', color=mycolors[6])
+        axes[axis_index].set_ylabel('Pressure [kPa]')
+        axis_index += 1
 
-    # 4) Temperature
-    axes[2].plot(t, f1.binned_temperature, 'o-', color=mycolors[5])
-    axes[2].set_ylabel('Temperature [°C]')
-    axes[2].grid(True, which='both', linestyle='--', alpha=0.5)
+        axes[axis_index].plot(t, f1.binned_temperature, 'o-', color=mycolors[5])
+        axes[axis_index].set_ylabel('Temperature [°C]')
+        axis_index += 1
 
     # 5) Acceleration (if present)
     if f1.has_MPU6050:
         accel_err = np.full_like(f1.binned_accel_x, 0.001)  # Example 1 mg uncertainty
-        axes[3].errorbar(t, f1.binned_accel_x, yerr=accel_err, fmt='o-', color=mycolors[7], alpha=0.7, markersize=2, label='Ax')
-        axes[3].errorbar(t, f1.binned_accel_y, yerr=accel_err, fmt='o-', color=mycolors[3], alpha=0.7, markersize=2, label='Ay')
-        axes[3].errorbar(t, f1.binned_accel_z, yerr=accel_err, fmt='o-', color=mycolors[1], alpha=0.7, markersize=2, label='Az')
-        axes[3].set_ylabel('Accel [g]')
-        axes[3].legend(loc='upper right', fontsize=8)
+        axes[axis_index].errorbar(t, f1.binned_accel_x, yerr=accel_err, fmt='o-', color=mycolors[7], alpha=0.7, markersize=2, label='Ax')
+        axes[axis_index].errorbar(t, f1.binned_accel_y, yerr=accel_err, fmt='o-', color=mycolors[3], alpha=0.7, markersize=2, label='Ay')
+        axes[axis_index].errorbar(t, f1.binned_accel_z, yerr=accel_err, fmt='o-', color=mycolors[1], alpha=0.7, markersize=2, label='Az')
+        axes[axis_index].set_ylabel('Accel [g]')
+        axes[axis_index].legend(loc='upper right', fontsize=8)
+        axis_index += 1
 
     # 6) Angular velocity (if present)
     if f1.has_MPU6050:
         gyro_err = np.full_like(f1.binned_gyro_x, 0.1)  # Example 0.1°/s uncertainty
-        axes[4].errorbar(t, f1.binned_gyro_x, yerr=gyro_err, fmt='o-', color=mycolors[7], alpha=0.7, markersize=2, label='ωx')
-        axes[4].errorbar(t, f1.binned_gyro_y, yerr=gyro_err, fmt='o-', color=mycolors[3], alpha=0.7, markersize=2, label='ωy')
-        axes[4].errorbar(t, f1.binned_gyro_z, yerr=gyro_err, fmt='o-', color=mycolors[1], alpha=0.7, markersize=2, label='ωz')
-        axes[4].set_ylabel('Gyro [°/s]')
-        axes[4].legend(loc='upper right', fontsize=8)
+        axes[axis_index].errorbar(t, f1.binned_gyro_x, yerr=gyro_err, fmt='o-', color=mycolors[7], alpha=0.7, markersize=2, label='ωx')
+        axes[axis_index].errorbar(t, f1.binned_gyro_y, yerr=gyro_err, fmt='o-', color=mycolors[3], alpha=0.7, markersize=2, label='ωy')
+        axes[axis_index].errorbar(t, f1.binned_gyro_z, yerr=gyro_err, fmt='o-', color=mycolors[1], alpha=0.7, markersize=2, label='ωz')
+        axes[axis_index].set_ylabel('Gyro [°/s]')
+        axes[axis_index].legend(loc='upper right', fontsize=8)
 
-    axes[4].grid(True, which='both', linestyle='--', alpha=0.5)
+    for axis in axes:
+        axis.grid(True, which='both', linestyle='--', alpha=0.5)
 
     # common x-label
     axes[-1].set_xlabel('Time [min]')
