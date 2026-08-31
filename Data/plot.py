@@ -5,6 +5,7 @@
 import sys, os, time, warnings, argparse
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from scipy.stats import landau
 import numpy as np
 
 
@@ -23,6 +24,10 @@ plt.rcParams["mathtext.fontset"] = "dejavuserif"
 # Define your own color palette
 mycolors = ['#c70039','#ff5733','#ff8d1a','#ffc300','#eddd53','#add45c','#57c785',
                '#00baad','#2a7b9b','#3d3d6b','#511849','#900c3f','#900c3f']
+
+# Mode of scipy.stats.landau in its standardized parametrization.  Including
+# this offset makes the fitted ``mpv`` parameter the actual distribution peak.
+LANDAU_STANDARD_MODE = -0.4293145383
 
 def time_coincidence_analysis(timestamps_s, detector_names, window_ms=10.0):
     """Return the coincident-event mask and number of cross-detector pairs."""
@@ -60,6 +65,78 @@ def time_coincidence_analysis(timestamps_s, detector_names, window_ms=10.0):
 def coincidences_from_computer_time(timestamps_s, detector_names, window_ms=10.0):
     """Mark events from different detectors separated by at most ``window_ms``."""
     return time_coincidence_analysis(timestamps_s, detector_names, window_ms)[0]
+
+
+def cross_detector_time_differences(timestamps_s, detector_names, max_abs_ms=20.0):
+    """Return signed time differences for every unordered detector pair.
+
+    For a pair ``A, B`` the sign convention is ``t_B - t_A``. All event
+    combinations inside ``+/- max_abs_ms`` are retained, so the prompt peak
+    and the approximately flat accidental background can both be inspected.
+    """
+    timestamps_s = np.asarray(timestamps_s, dtype=float)
+    detector_names = np.asarray(detector_names, dtype=str)
+    if len(timestamps_s) != len(detector_names):
+        raise ValueError('Timestamps and detector names must have the same length')
+    if max_abs_ms <= 0:
+        raise ValueError('The delta-t histogram range must be greater than zero')
+
+    max_abs_s = max_abs_ms / 1000.0
+    names = sorted(set(detector_names))
+    differences = {}
+    for i, name_a in enumerate(names):
+        times_a = np.sort(timestamps_s[detector_names == name_a])
+        for name_b in names[i + 1:]:
+            times_b = np.sort(timestamps_s[detector_names == name_b])
+            pair_differences = []
+            for time_a in times_a:
+                first = np.searchsorted(times_b, time_a - max_abs_s, side='left')
+                last = np.searchsorted(times_b, time_a + max_abs_s, side='right')
+                if last > first:
+                    pair_differences.extend((times_b[first:last] - time_a) * 1000.0)
+            differences[(name_a, name_b)] = np.asarray(pair_differences, dtype=float)
+    return differences
+
+
+def plot_delta_t_histogram(timestamps_s, detector_names, window_ms, max_abs_ms,
+                           pdf_name, nbins=201):
+    """Plot cross-detector delta-t distributions and the coincidence window."""
+    differences = cross_detector_time_differences(
+        timestamps_s, detector_names, max_abs_ms=max_abs_ms
+    )
+    if not differences:
+        print('Skipping delta-t histogram: fewer than two detectors are present')
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    bins = np.linspace(-max_abs_ms, max_abs_ms, nbins)
+    plotted = False
+    for index, ((name_a, name_b), values) in enumerate(differences.items()):
+        if len(values) == 0:
+            continue
+        ax.hist(
+            values, bins=bins, histtype='step', linewidth=1.6,
+            color=mycolors[index % len(mycolors)], label=f'{name_b} - {name_a}'
+        )
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print('Skipping delta-t histogram: no event pairs fall inside the requested range')
+        return
+
+    ax.axvline(-window_ms, color='black', linestyle='--', linewidth=1.2)
+    ax.axvline(window_ms, color='black', linestyle='--', linewidth=1.2,
+               label=r'Coincidence window: $\pm$%.3g ms' % window_ms)
+    ax.set_xlabel(r'$\Delta t = t_B-t_A$ [ms]')
+    ax.set_ylabel('Event pairs / bin')
+    ax.set_xlim(-max_abs_ms, max_abs_ms)
+    ax.grid(which='both', linestyle='--', alpha=0.5)
+    ax.legend(fontsize=11, fancybox=True, frameon=True)
+    fig.tight_layout()
+    print('Saving Figure to: ' + os.getcwd() + '/' + pdf_name)
+    fig.savefig(pdf_name, format='pdf', transparent=True)
+    plt.show()
 
 class CWClass():
     def __init__(self, fname, bin_size=60, coincidence_source='device',
@@ -643,7 +720,9 @@ class NPlot():
                  colors,
                  labels,
                  xmin,xmax,ymin,ymax,
-                 figsize = [8,6],fontsize = 15,nbins = 101, alpha = 0.85,fit_gaussian=False,
+                 figsize = [8,6],fontsize = 15,nbins = 101, alpha = 0.85,
+                 fit_gaussian=False, fit_landau=False, landau_data_index=0,
+                 landau_fit_range=(15.0, 80.0), landau_initial_mpv=40.0,
                  xscale = 'log',yscale = 'log',xlabel = '',loc = 1,pdf_name='',lw=2, title=''):
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True, 
@@ -681,6 +760,8 @@ class NPlot():
         ax1.set_title(title, fontsize=fontsize + 1)
 
         hist_data = []
+        hist_uncertainties = []
+        hist_edges = []
         std = []
         bin_centers = []
 
@@ -698,14 +779,82 @@ class NPlot():
             sum_weights_sqrd, _ = np.histogram(valid_data, bins=bins, weights=np.power(valid_weights, 2))
 
             hist_data.append(counts)
+            hist_uncertainties.append(np.sqrt(sum_weights_sqrd))
+            hist_edges.append(bin_edges)
             upper_value = plusSTD(counts,sum_weights_sqrd)
             lower_value = subSTD(counts,sum_weights_sqrd)
             std.append([upper_value,lower_value])
             bin_centers.append(bin_center)
             fill_between_steps(bin_center, upper_value,lower_value,  color = colors[i],alpha = alpha,lw=lw,ax=ax1)
             ax1.plot([1e14,1e14], label = labels[i],color = colors[i],alpha = alpha,linewidth = 2)
-            
-            
+
+        if fit_landau:
+            fit_index = min(max(int(landau_data_index), 0), len(hist_data) - 1)
+            centers = bin_centers[fit_index]
+            values = hist_data[fit_index]
+            uncertainties = hist_uncertainties[fit_index]
+            edges = hist_edges[fit_index]
+            fit_min, fit_max = landau_fit_range
+            fit_mask = (
+                np.isfinite(centers) & np.isfinite(values) & (values >= 0)
+                & (centers >= fit_min) & (centers <= fit_max)
+            )
+
+            try:
+                if np.count_nonzero(fit_mask) < 5:
+                    raise RuntimeError('not enough populated bins in the fit interval')
+                fit_x = centers[fit_mask]
+                fit_y = values[fit_mask]
+                fit_low_edges = edges[:-1][fit_mask]
+                fit_high_edges = edges[1:][fit_mask]
+                fit_sigma = uncertainties[fit_mask]
+                positive_sigma = fit_sigma[fit_sigma > 0]
+                if len(positive_sigma) > 0:
+                    fit_sigma = np.where(
+                        fit_sigma > 0, fit_sigma, np.min(positive_sigma)
+                    )
+                else:
+                    fit_sigma = None
+
+                # Integrate the true Landau PDF over each logarithmic histogram
+                # bin. ``mpv`` is explicitly shifted to be the peak position.
+                def landau_bin_model(_x, area, mpv, width):
+                    upper = (
+                        (fit_high_edges - mpv) / width + LANDAU_STANDARD_MODE
+                    )
+                    lower = (
+                        (fit_low_edges - mpv) / width + LANDAU_STANDARD_MODE
+                    )
+                    return area * (landau.cdf(upper) - landau.cdf(lower))
+
+                initial_width = 10.0
+                initial_amplitude = max(np.sum(fit_y), np.finfo(float).eps)
+                parameters, covariance = curve_fit(
+                    landau_bin_model, fit_x, fit_y,
+                    p0=(initial_amplitude, landau_initial_mpv, initial_width),
+                    sigma=fit_sigma,
+                    absolute_sigma=fit_sigma is not None,
+                    bounds=(
+                        (0.0, fit_min, 0.05),
+                        (np.inf, fit_max, fit_max - fit_min),
+                    ),
+                    maxfev=20000,
+                )
+                _, fitted_mpv, fitted_width = parameters
+                mpv_error = float(np.sqrt(max(covariance[1, 1], 0.0)))
+                ax1.plot(
+                    fit_x, landau_bin_model(fit_x, *parameters),
+                    color='black', linestyle='--', linewidth=1.8,
+                    label=(r'Landau: MPV = %.2f $\pm$ %.2f mV, '
+                           r'width = %.2f mV'
+                           % (fitted_mpv, mpv_error, fitted_width)),
+                )
+                print(
+                    '    -- Landau SiPM fit: MPV = %.3f +/- %.3f mV, '
+                    'width = %.3f mV' % (fitted_mpv, mpv_error, fitted_width)
+                )
+            except (RuntimeError, ValueError, FloatingPointError) as error:
+                print('Warning: SiPM Landau fit failed: %s' % error)
 
         ax1.set_yscale(yscale)
         ax1.set_xscale(xscale)
@@ -809,6 +958,10 @@ def main():
         '-w', '--coincidence-window-ms', type=float, default=10.0,
         help="Time coincidence window in milliseconds when --coincidence-source=time (default: 10)"
     )
+    parser.add_argument(
+        '--delta-t-range-ms', type=float, default=20.0,
+        help="Half-range of the cross-detector delta-t histogram in ms (default: 20)"
+    )
 
     args = parser.parse_args()
 
@@ -859,8 +1012,18 @@ def main():
                 r'Non-Coincident:  ' + str(f1.count_rate_non_coincident) + '+/-' + str(f1.count_rate_err_non_coincident) +' Hz',
                 r'Coincident: ' + str(f1.count_rate_coincident) + '+/-' + str(f1.count_rate_err_coincident) +' Hz'],
         xmin=None, xmax=None, ymin=None, ymax=None,xscale='log',nbins = 51,
-        xlabel='SiPM Peak Voltage [mV]',fit_gaussian=True,
+        xlabel='SiPM Peak Voltage [mV]', fit_landau=True,
+        landau_data_index=2, landau_fit_range=(25.0, 1000.0),
+        landau_initial_mpv=40.0,
         pdf_name=pdf_file_location+'/'+infile_name+'_SiPM_peak_voltage.pdf',title = '',)
+
+    if f1.file_from_computer and f1.n_detector >= 2:
+        plot_delta_t_histogram(
+            f1.time_stamp_s, f1.detector_name,
+            window_ms=args.coincidence_window_ms,
+            max_abs_ms=args.delta_t_range_ms,
+            pdf_name=pdf_file_location+'/'+infile_name+'_coincidence_delta_t.pdf',
+        )
     
     
     rate_legend_extra = []
