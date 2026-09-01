@@ -4,7 +4,8 @@
 
 import sys, os, time, warnings, argparse
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, least_squares
+from scipy.signal import fftconvolve
 from scipy.stats import landau
 import numpy as np
 
@@ -24,6 +25,18 @@ plt.rcParams["mathtext.fontset"] = "dejavuserif"
 # Define your own color palette
 mycolors = ['#c70039','#ff5733','#ff8d1a','#ffc300','#eddd53','#add45c','#57c785',
                '#00baad','#2a7b9b','#3d3d6b','#511849','#900c3f','#900c3f']
+
+# Compact legends leave more of the measured distributions visible.
+LEGEND_FONTSIZE = 9
+DENSE_LEGEND_FONTSIZE = 8
+LEGEND_STYLE = {
+    'fancybox': True,
+    'frameon': True,
+    'borderpad': 0.35,
+    'labelspacing': 0.3,
+    'handlelength': 1.8,
+    'handletextpad': 0.5,
+}
 
 # Mode of scipy.stats.landau in its standardized parametrization.  Including
 # this offset makes the fitted ``mpv`` parameter the actual distribution peak.
@@ -65,6 +78,51 @@ def time_coincidence_analysis(timestamps_s, detector_names, window_ms=10.0):
 def coincidences_from_computer_time(timestamps_s, detector_names, window_ms=10.0):
     """Mark events from different detectors separated by at most ``window_ms``."""
     return time_coincidence_analysis(timestamps_s, detector_names, window_ms)[0]
+
+
+def unique_time_coincidence_pairs(timestamps_s, detector_names, window_ms=10.0):
+    """Build closest one-to-one matches independently for each detector pair."""
+    timestamps_s = np.asarray(timestamps_s, dtype=float)
+    detector_names = np.asarray(detector_names, dtype=str)
+    if len(timestamps_s) != len(detector_names):
+        raise ValueError('Timestamps and detector names must have the same length')
+    if window_ms <= 0:
+        raise ValueError('The coincidence window must be greater than zero')
+
+    window_s = window_ms / 1000.0
+    names = sorted(set(detector_names))
+    unique_pairs = []
+    for name_index, name_a in enumerate(names):
+        indices_a = np.where(detector_names == name_a)[0]
+        indices_a = indices_a[np.argsort(timestamps_s[indices_a], kind='mergesort')]
+        for name_b in names[name_index + 1:]:
+            indices_b = np.where(detector_names == name_b)[0]
+            indices_b = indices_b[np.argsort(timestamps_s[indices_b], kind='mergesort')]
+            times_b = timestamps_s[indices_b]
+            candidates = []
+            for index_a in indices_a:
+                time_a = timestamps_s[index_a]
+                first = np.searchsorted(times_b, time_a - window_s, side='left')
+                last = np.searchsorted(times_b, time_a + window_s, side='right')
+                for position_b in range(first, last):
+                    index_b = int(indices_b[position_b])
+                    candidates.append((
+                        abs(timestamps_s[index_b] - time_a),
+                        int(index_a), index_b,
+                    ))
+
+            # Events cannot be reused within the same detector pair. They may
+            # still participate in a different detector pair (a valid triple or
+            # higher-order coincidence).
+            used_a = set()
+            used_b = set()
+            for delta_t, index_a, index_b in sorted(candidates):
+                if index_a in used_a or index_b in used_b:
+                    continue
+                used_a.add(index_a)
+                used_b.add(index_b)
+                unique_pairs.append((index_a, index_b, delta_t))
+    return unique_pairs
 
 
 def cross_detector_time_differences(timestamps_s, detector_names, max_abs_ms=20.0):
@@ -132,7 +190,7 @@ def plot_delta_t_histogram(timestamps_s, detector_names, window_ms, max_abs_ms,
     ax.set_ylabel('Event pairs / bin')
     ax.set_xlim(-max_abs_ms, max_abs_ms)
     ax.grid(which='both', linestyle='--', alpha=0.5)
-    ax.legend(fontsize=11, fancybox=True, frameon=True)
+    ax.legend(fontsize=DENSE_LEGEND_FONTSIZE, **LEGEND_STYLE)
     fig.tight_layout()
     print('Saving Figure to: ' + os.getcwd() + '/' + pdf_name)
     fig.savefig(pdf_name, format='pdf', transparent=True)
@@ -146,6 +204,7 @@ class CWClass():
         self.coincidence_source = coincidence_source
         self.coincidence_window_ms = coincidence_window_ms
         self.coincidence_pair_count = None
+        self.unique_coincidence_pairs = []
         if coincidence_source not in ('device', 'time'):
             raise ValueError("coincidence_source must be 'device' or 'time'")
         
@@ -271,9 +330,17 @@ class CWClass():
                 coincident, self.coincidence_pair_count = time_coincidence_analysis(
                     self.time_stamp_s, detName, coincidence_window_ms
                 )
+                self.unique_coincidence_pairs = unique_time_coincidence_pairs(
+                    self.time_stamp_s, detName, coincidence_window_ms
+                )
                 print(
                     '  -> Coincidences calculated from computer Date/Time '
                     'with a %.3f ms window' % coincidence_window_ms
+                )
+                print(
+                    '  -> %d unique one-to-one detector-pair matches '
+                    '(%d total pair associations)'
+                    % (len(self.unique_coincidence_pairs), self.coincidence_pair_count)
                 )
 
         elif coincidence_source == 'time':
@@ -319,6 +386,18 @@ class CWClass():
 
         self.adc              = adc         # an arrray of the measured event ADC value
         self.sipm             = sipm        # an arrray of the measured event SiPM value
+        self.coincident_sipm_by_detector = {}
+        if self.file_from_computer and self.unique_coincidence_pairs:
+            paired_indices = np.asarray([
+                index
+                for first, second, _ in self.unique_coincidence_pairs
+                for index in (first, second)
+            ], dtype=int)
+            for detector_name in sorted(set(detName)):
+                detector_indices = np.unique(
+                    paired_indices[detName[paired_indices] == detector_name]
+                )
+                self.coincident_sipm_by_detector[detector_name] = self.sipm[detector_indices]
         
         self.temperature      = temperature         # an arrray of the measured event ADC value
         self.pressure        = pressure         # an arrray of the measured event ADC value
@@ -789,76 +868,93 @@ class NPlot():
             ax1.plot([1e14,1e14], label = labels[i],color = colors[i],alpha = alpha,linewidth = 2)
 
         if fit_landau:
-            fit_index = min(max(int(landau_data_index), 0), len(hist_data) - 1)
-            centers = bin_centers[fit_index]
-            values = hist_data[fit_index]
-            uncertainties = hist_uncertainties[fit_index]
-            edges = hist_edges[fit_index]
-            fit_min, fit_max = landau_fit_range
-            fit_mask = (
-                np.isfinite(centers) & np.isfinite(values) & (values >= 0)
-                & (centers >= fit_min) & (centers <= fit_max)
-            )
-
-            try:
-                if np.count_nonzero(fit_mask) < 5:
-                    raise RuntimeError('not enough populated bins in the fit interval')
-                fit_x = centers[fit_mask]
-                fit_y = values[fit_mask]
-                fit_low_edges = edges[:-1][fit_mask]
-                fit_high_edges = edges[1:][fit_mask]
-                fit_sigma = uncertainties[fit_mask]
-                positive_sigma = fit_sigma[fit_sigma > 0]
-                if len(positive_sigma) > 0:
-                    fit_sigma = np.where(
-                        fit_sigma > 0, fit_sigma, np.min(positive_sigma)
-                    )
-                else:
-                    fit_sigma = None
-
-                # Integrate the true Landau PDF over each logarithmic histogram
-                # bin. ``mpv`` is explicitly shifted to be the peak position.
-                def landau_bin_model(_x, area, mpv, width):
-                    upper = (
-                        (fit_high_edges - mpv) / width + LANDAU_STANDARD_MODE
-                    )
-                    lower = (
-                        (fit_low_edges - mpv) / width + LANDAU_STANDARD_MODE
-                    )
-                    return area * (landau.cdf(upper) - landau.cdf(lower))
-
-                initial_width = 10.0
-                initial_amplitude = max(np.sum(fit_y), np.finfo(float).eps)
-                parameters, covariance = curve_fit(
-                    landau_bin_model, fit_x, fit_y,
-                    p0=(initial_amplitude, landau_initial_mpv, initial_width),
-                    sigma=fit_sigma,
-                    absolute_sigma=fit_sigma is not None,
-                    bounds=(
-                        (0.0, fit_min, 0.05),
-                        (np.inf, fit_max, fit_max - fit_min),
-                    ),
-                    maxfev=20000,
+            requested_fit_indices = np.atleast_1d(landau_data_index).astype(int)
+            for requested_index in requested_fit_indices:
+                fit_index = min(max(requested_index, 0), len(hist_data) - 1)
+                centers = bin_centers[fit_index]
+                values = hist_data[fit_index]
+                uncertainties = hist_uncertainties[fit_index]
+                edges = hist_edges[fit_index]
+                fit_min, fit_max = landau_fit_range
+                fit_mask = (
+                    np.isfinite(centers) & np.isfinite(values) & (values >= 0)
+                    & (centers >= fit_min) & (centers <= fit_max)
                 )
-                _, fitted_mpv, fitted_width = parameters
-                mpv_error = float(np.sqrt(max(covariance[1, 1], 0.0)))
-                ax1.plot(
-                    fit_x, landau_bin_model(fit_x, *parameters),
-                    color='black', linestyle='--', linewidth=1.8,
-                    label=(r'Landau: MPV = %.2f $\pm$ %.2f mV, '
-                           r'width = %.2f mV'
-                           % (fitted_mpv, mpv_error, fitted_width)),
-                )
-                print(
-                    '    -- Landau SiPM fit: MPV = %.3f +/- %.3f mV, '
-                    'width = %.3f mV' % (fitted_mpv, mpv_error, fitted_width)
-                )
-            except (RuntimeError, ValueError, FloatingPointError) as error:
-                print('Warning: SiPM Landau fit failed: %s' % error)
+
+                try:
+                    if np.count_nonzero(fit_mask) < 5:
+                        raise RuntimeError('not enough populated bins in the fit interval')
+                    fit_x = centers[fit_mask]
+                    fit_y = values[fit_mask]
+                    fit_low_edges = edges[:-1][fit_mask]
+                    fit_high_edges = edges[1:][fit_mask]
+                    fit_sigma = uncertainties[fit_mask]
+                    positive_sigma = fit_sigma[fit_sigma > 0]
+                    if len(positive_sigma) > 0:
+                        fit_sigma = np.where(
+                            fit_sigma > 0, fit_sigma, np.min(positive_sigma)
+                        )
+                    else:
+                        fit_sigma = None
+
+                    # Integrate the true Landau PDF over each logarithmic
+                    # histogram bin. ``mpv`` is the actual peak position.
+                    def landau_bin_model(_x, area, mpv, width):
+                        upper = (
+                            (fit_high_edges - mpv) / width + LANDAU_STANDARD_MODE
+                        )
+                        lower = (
+                            (fit_low_edges - mpv) / width + LANDAU_STANDARD_MODE
+                        )
+                        return area * (landau.cdf(upper) - landau.cdf(lower))
+
+                    initial_width = 10.0
+                    initial_amplitude = max(np.sum(fit_y), np.finfo(float).eps)
+                    parameters, covariance = curve_fit(
+                        landau_bin_model, fit_x, fit_y,
+                        p0=(initial_amplitude, landau_initial_mpv, initial_width),
+                        sigma=fit_sigma,
+                        absolute_sigma=fit_sigma is not None,
+                        bounds=(
+                            (0.0, fit_min, 0.05),
+                            (np.inf, fit_max, fit_max - fit_min),
+                        ),
+                        maxfev=20000,
+                    )
+                    _, fitted_mpv, fitted_width = parameters
+                    mpv_error = float(np.sqrt(max(covariance[1, 1], 0.0)))
+                    fitted_values = landau_bin_model(fit_x, *parameters)
+                    if fit_sigma is not None:
+                        chi_squared = np.sum(((fit_y - fitted_values) / fit_sigma) ** 2)
+                        ndf = max(len(fit_y) - len(parameters), 1)
+                        reduced_chi_squared = chi_squared / ndf
+                    else:
+                        reduced_chi_squared = np.nan
+                    fit_name = labels[fit_index].split(':', 1)[0]
+                    fit_name = fit_name.replace('Coincident ', '')
+                    ax1.plot(
+                        fit_x, fitted_values,
+                        color=colors[fit_index], linestyle='--', linewidth=1.8,
+                        label=(r'Landau %s: MPV=%.2f $\pm$ %.2f mV, '
+                               r'w=%.2f mV'
+                               % (fit_name, fitted_mpv, mpv_error, fitted_width)),
+                    )
+                    print(
+                        '    -- Landau %s fit: MPV = %.3f +/- %.3f mV, '
+                        'width = %.3f mV, chi2/ndf = %.2f'
+                        % (fit_name, fitted_mpv, mpv_error, fitted_width,
+                           reduced_chi_squared)
+                    )
+                except (RuntimeError, ValueError, FloatingPointError) as error:
+                    print('Warning: SiPM Landau fit failed for %s: %s'
+                          % (labels[fit_index], error))
 
         ax1.set_yscale(yscale)
         ax1.set_xscale(xscale)
-        ax1.legend(fontsize=fontsize - 2, loc=loc, fancybox=True, frameon=True)
+        legend_fontsize = (
+            DENSE_LEGEND_FONTSIZE if len(labels) > 3 else LEGEND_FONTSIZE
+        )
+        ax1.legend(fontsize=legend_fontsize, loc=loc, **LEGEND_STYLE)
         ax1.set_ylabel(r'Rate/bin [s$^{-1}$]', size=fontsize)
         ax1.set_xlim(xmin, xmax)
         ax1.set_ylim(ymin, ymax)
@@ -893,6 +989,232 @@ class NPlot():
             print('Saving Figure to: '+os.getcwd() +  '/'+pdf_name)
             plt.savefig(pdf_name, format='pdf',transparent =True)
         plt.show()
+
+
+def plot_coincident_sipm_langauss(values, live_time_s, detector_name, pdf_name,
+                                  fit_range=(25.0, 200.0), nbins=51,
+                                  color='#c70039', singles_values=None,
+                                  accidental_rate_hz=0.0):
+    """Plot one detector's unique coincident pulses and fit Landau (x) Gaussian."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values) & (values > 0)]
+    if len(values) < 10:
+        print('Skipping Langau fit for %s: not enough coincident events'
+              % detector_name)
+        return None
+
+    xmin = max(float(np.min(values)) * 0.9, 0.1)
+    xmax = float(np.max(values)) * 1.1
+    bins = np.logspace(np.log10(xmin), np.log10(xmax), nbins)
+    counts, edges = np.histogram(values, bins=bins)
+    rates = counts / live_time_s
+    errors = np.sqrt(counts) / live_time_s
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    # The accidental pulse-height shape is the singles spectrum. Normalize it
+    # to the analytic accidental rate involving this detector and keep it fixed
+    # while fitting the Langau signal component.
+    accidental_rates = np.zeros_like(rates)
+    if singles_values is not None and accidental_rate_hz > 0:
+        singles_values = np.asarray(singles_values, dtype=float)
+        singles_values = singles_values[
+            np.isfinite(singles_values) & (singles_values > 0)
+        ]
+        if len(singles_values) > 0:
+            singles_counts, _ = np.histogram(singles_values, bins=edges)
+            singles_rate_hz = len(singles_values) / live_time_s
+            accidental_rates = (
+                singles_counts / live_time_s
+                * accidental_rate_hz / singles_rate_hz
+            )
+    fit_min, fit_max = fit_range
+    fit_mask = (centers >= fit_min) & (centers <= fit_max)
+    fit_x = centers[fit_mask]
+    fit_y = rates[fit_mask]
+    fit_counts = counts[fit_mask]
+    fit_accidental_rates = accidental_rates[fit_mask]
+    fit_low_edges = edges[:-1][fit_mask]
+    fit_high_edges = edges[1:][fit_mask]
+    fit_sigma = errors[fit_mask]
+    fit_sigma = np.where(fit_sigma > 0, fit_sigma, 1.0 / live_time_s)
+
+    # A fixed fine grid makes the numerical convolution stable during fitting.
+    grid_step = 0.5  # mV
+    grid_min = fit_min - 1200.0
+    grid_max = fit_max + 2000.0
+    grid = np.arange(grid_min, grid_max + grid_step, grid_step)
+    if len(grid) % 2 == 0:
+        grid = np.append(grid, grid[-1] + grid_step)
+    kernel_x = (np.arange(len(grid)) - len(grid) // 2) * grid_step
+
+    def convolved_pdf_and_cdf(mpv, landau_width, gaussian_sigma):
+        standardized = (
+            (grid - mpv) / landau_width + LANDAU_STANDARD_MODE
+        )
+        landau_pdf = landau.pdf(standardized) / landau_width
+        gaussian_pdf = np.exp(-0.5 * (kernel_x / gaussian_sigma) ** 2)
+        gaussian_pdf /= np.sqrt(2.0 * np.pi) * gaussian_sigma
+        convolved_pdf = fftconvolve(
+            landau_pdf, gaussian_pdf, mode='same'
+        ) * grid_step
+        convolved_pdf = np.maximum(convolved_pdf, 0.0)
+        convolved_cdf = np.zeros_like(convolved_pdf)
+        convolved_cdf[1:] = np.cumsum(
+            0.5 * (convolved_pdf[1:] + convolved_pdf[:-1]) * grid_step
+        )
+        return convolved_pdf, convolved_cdf
+
+    def langauss_bin_model(_x, area, mpv, landau_width, gaussian_sigma):
+        _, convolved_cdf = convolved_pdf_and_cdf(
+            mpv, landau_width, gaussian_sigma
+        )
+        upper = np.interp(fit_high_edges, grid, convolved_cdf)
+        lower = np.interp(fit_low_edges, grid, convolved_cdf)
+        return area * (upper - lower) + fit_accidental_rates
+
+    fit_result = None
+    try:
+        if np.count_nonzero(fit_mask) < 6:
+            raise RuntimeError('not enough bins in the fit interval')
+        initial_parameters = np.asarray([
+            max(np.sum(fit_y - fit_accidental_rates), np.finfo(float).eps),
+            40.0, 7.0, 5.0,
+        ])
+
+        def poisson_deviance_residuals(parameters):
+            expected_counts = np.maximum(
+                langauss_bin_model(fit_x, *parameters) * live_time_s,
+                np.finfo(float).eps,
+            )
+            deviance_terms = expected_counts - fit_counts
+            positive = fit_counts > 0
+            deviance_terms[positive] += fit_counts[positive] * np.log(
+                fit_counts[positive] / expected_counts[positive]
+            )
+            signs = np.sign(fit_counts - expected_counts)
+            return signs * np.sqrt(np.maximum(2.0 * deviance_terms, 0.0))
+
+        optimization = least_squares(
+            poisson_deviance_residuals,
+            x0=initial_parameters,
+            bounds=(
+                (0.0, fit_min, 0.1, 0.1),
+                (np.inf, fit_max, 200.0, 200.0),
+            ),
+            max_nfev=30000,
+        )
+        if not optimization.success:
+            raise RuntimeError(optimization.message)
+        parameters = optimization.x
+        covariance = np.linalg.pinv(optimization.jac.T @ optimization.jac)
+        parameter_errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+        fitted_values = langauss_bin_model(fit_x, *parameters)
+        poisson_deviance = np.sum(
+            poisson_deviance_residuals(parameters) ** 2
+        )
+        ndf = max(len(fit_y) - len(parameters), 1)
+        reduced_chi_squared = poisson_deviance / ndf
+        area, mpv, landau_width, gaussian_sigma = parameters
+        convolved_pdf, _ = convolved_pdf_and_cdf(
+            mpv, landau_width, gaussian_sigma
+        )
+        langauss_peak = float(grid[np.argmax(convolved_pdf)])
+        fit_result = {
+            'mpv': mpv,
+            'mpv_error': parameter_errors[1],
+            'landau_width': landau_width,
+            'landau_width_error': parameter_errors[2],
+            'gaussian_sigma': gaussian_sigma,
+            'gaussian_sigma_error': parameter_errors[3],
+            'peak': langauss_peak,
+            'chi2_ndf': reduced_chi_squared,
+            'accidental_rate': accidental_rate_hz,
+        }
+        print(
+            '    -- Langau %s: Landau MPV = %.3f +/- %.3f mV, '
+            'Landau width = %.3f +/- %.3f mV, Gaussian sigma = '
+            '%.3f +/- %.3f mV, convolved peak = %.3f mV, deviance/ndf = %.2f'
+            % (detector_name, mpv, parameter_errors[1], landau_width,
+               parameter_errors[2], gaussian_sigma, parameter_errors[3],
+               langauss_peak, reduced_chi_squared)
+        )
+    except (RuntimeError, ValueError, FloatingPointError) as error:
+        print('Warning: Langau fit failed for %s: %s'
+              % (detector_name, error))
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(8, 6), sharex=True,
+        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.08}
+    )
+    lower_rates = np.maximum(rates - errors, 0.0)
+    upper_rates = rates + errors
+    fill_between_steps(
+        centers, upper_rates, lower_rates, color=color, alpha=0.35, ax=ax1
+    )
+    ax1.step(
+        edges[:-1], rates, where='post', color=color, linewidth=1.8,
+        label='Coincident %s: %.4f Hz'
+        % (detector_name, len(values) / live_time_s)
+    )
+
+    if np.any(accidental_rates > 0):
+        ax1.step(
+            edges[:-1], accidental_rates, where='post', color='gray',
+            linestyle=':', linewidth=1.6,
+            label=r'Accidental template: %.4f Hz' % accidental_rate_hz
+        )
+
+    if fit_result is not None:
+        if (
+            fit_result['gaussian_sigma_error']
+            > 2.0 * fit_result['gaussian_sigma']
+            or fit_result['gaussian_sigma'] <= 0.2
+        ):
+            gaussian_label = r'$\sigma_G$ unconstrained'
+            print('Warning: Gaussian resolution is not constrained for %s'
+                  % detector_name)
+        else:
+            gaussian_label = (
+                r'$\sigma_G$=%.2f $\pm$ %.2f mV'
+                % (fit_result['gaussian_sigma'],
+                   fit_result['gaussian_sigma_error'])
+            )
+        ax1.plot(
+            fit_x, fitted_values, color='black', linestyle='--', linewidth=2,
+            label=(r'Langau + accidental: MPV$_L$=%.2f $\pm$ %.2f mV, '
+                   '\n' r'%s, deviance/ndf=%.1f'
+                   % (fit_result['mpv'], fit_result['mpv_error'],
+                      gaussian_label, fit_result['chi2_ndf']))
+        )
+        expected_counts = np.maximum(
+            fitted_values * live_time_s, np.finfo(float).eps
+        )
+        pulls = (fit_counts - expected_counts) / np.sqrt(expected_counts)
+        ax2.axhline(0.0, color='black', linewidth=1)
+        ax2.plot(fit_x, pulls, marker='o', linestyle='none', color=color,
+                 markersize=3)
+
+    positive_rates = rates[rates > 0]
+    ax1.set_xscale('log')
+    ax1.set_yscale('log')
+    ax1.set_xlim(xmin, xmax)
+    if len(positive_rates) > 0:
+        ax1.set_ylim(np.min(positive_rates) * 0.5, np.max(positive_rates) * 3.0)
+    ax1.set_ylabel(r'Rate/bin [s$^{-1}$]')
+    ax1.set_title('Coincident SiPM spectrum - %s' % detector_name)
+    ax1.grid(which='both', linestyle='--', alpha=0.5)
+    ax1.legend(fontsize=DENSE_LEGEND_FONTSIZE, **LEGEND_STYLE)
+
+    ax2.set_xscale('log')
+    ax2.set_ylabel('Pull')
+    ax2.set_xlabel('SiPM Peak Voltage [mV]')
+    ax2.set_ylim(-6.0, 6.0)
+    ax2.grid(which='both', linestyle='--', alpha=0.5)
+    fig.tight_layout()
+    print('Saving Figure to: ' + os.getcwd() + '/' + pdf_name)
+    fig.savefig(pdf_name, format='pdf', transparent=True)
+    plt.show()
+    return fit_result
 
 class ratePlot():
     def __init__(self,
@@ -937,7 +1259,22 @@ class ratePlot():
         for extra_label in legend_extra or []:
             ax1.plot([], [], linestyle='none', marker='', label=extra_label)
 
-        plt.legend(fontsize=fontsize-3,loc = loc,  fancybox = True,frameon=True)
+        legend_entry_count = len(labels) + len(legend_extra or [])
+        legend_fontsize = (
+            DENSE_LEGEND_FONTSIZE
+            if legend_entry_count > 4 else LEGEND_FONTSIZE
+        )
+        # A dense rate legend otherwise hides the highest-rate series when the
+        # caller requests the traditional upper-right position.
+        dense_upper_right = legend_entry_count > 4 and loc in (1, 'upper right')
+        legend_loc = 'center right' if dense_upper_right else loc
+        legend_position = {'bbox_to_anchor': (1.0, 0.38)} if dense_upper_right else {}
+        plt.legend(
+            fontsize=legend_fontsize,
+            loc=legend_loc,
+            **legend_position,
+            **LEGEND_STYLE,
+        )
         
         plt.title(title,fontsize=fontsize+1)
         plt.tight_layout()
@@ -1003,19 +1340,85 @@ def main():
         xlabel='Meausred ADC peak value [0-4095]',
         pdf_name=pdf_file_location+'/'+infile_name+'_ADC.pdf',title = '')
     
-    # Plot the Calculated SiPM Peak voltages coincident and non-coincident events
+    # For time coincidences, do not merge the two detector measurements into a
+    # single doubled spectrum. Use unique one-to-one pairs and retain one
+    # conditional pulse-height spectrum per detector.
+    sipm_data = [f1.sipm, f1.sipm[~f1.select_coincident]]
+    sipm_weights = [f1.weights, f1.weights[~f1.select_coincident]]
+    sipm_colors = [mycolors[7], mycolors[3]]
+    sipm_labels = [
+        r'All Events:  ' + str(f1.count_rate) + '+/-' + str(f1.count_rate_err) +' Hz',
+        r'Non-Coincident:  ' + str(f1.count_rate_non_coincident) + '+/-'
+        + str(f1.count_rate_err_non_coincident) +' Hz',
+    ]
+    if f1.coincidence_source == 'time' and f1.coincident_sipm_by_detector:
+        detector_plot_colors = [mycolors[1], mycolors[10], mycolors[5], mycolors[8]]
+        for detector_index, (detector_name, values) in enumerate(
+                f1.coincident_sipm_by_detector.items()):
+            sipm_data.append(values)
+            sipm_weights.append(np.ones(len(values)) / f1.live_time_s)
+            sipm_colors.append(
+                detector_plot_colors[detector_index % len(detector_plot_colors)]
+            )
+            sipm_labels.append(
+                'Coincident %s: %.4f Hz'
+                % (detector_name, len(values) / f1.live_time_s)
+            )
+        landau_fit_indices = list(range(2, len(sipm_data)))
+    else:
+        sipm_data.append(f1.sipm[f1.select_coincident])
+        sipm_weights.append(f1.weights[f1.select_coincident])
+        sipm_colors.append(mycolors[1])
+        sipm_labels.append(
+            r'Coincident: ' + str(f1.count_rate_coincident) + '+/-'
+            + str(f1.count_rate_err_coincident) +' Hz'
+        )
+        landau_fit_indices = [2]
+
+    # Plot the calculated SiPM peak voltages.
     c = NPlot(
-        data=[f1.sipm, f1.sipm[~f1.select_coincident],f1.sipm[f1.select_coincident]],
-        weights=[f1.weights, f1.weights[~f1.select_coincident],f1.weights[f1.select_coincident]],
-        colors=[mycolors[7], mycolors[3],mycolors[1]],
-        labels=[r'All Events:  ' + str(f1.count_rate) + '+/-' + str(f1.count_rate_err) +' Hz',
-                r'Non-Coincident:  ' + str(f1.count_rate_non_coincident) + '+/-' + str(f1.count_rate_err_non_coincident) +' Hz',
-                r'Coincident: ' + str(f1.count_rate_coincident) + '+/-' + str(f1.count_rate_err_coincident) +' Hz'],
+        data=sipm_data,
+        weights=sipm_weights,
+        colors=sipm_colors,
+        labels=sipm_labels,
         xmin=None, xmax=None, ymin=None, ymax=None,xscale='log',nbins = 51,
         xlabel='SiPM Peak Voltage [mV]', fit_landau=True,
-        landau_data_index=2, landau_fit_range=(25.0, 1000.0),
+        landau_data_index=landau_fit_indices, landau_fit_range=(25.0, 200.0),
         landau_initial_mpv=40.0,
         pdf_name=pdf_file_location+'/'+infile_name+'_SiPM_peak_voltage.pdf',title = '',)
+
+    # Produce one dedicated, deduplicated Langau plot for each detector in the
+    # time-coincidence sample.
+    if f1.coincidence_source == 'time' and f1.coincident_sipm_by_detector:
+        for detector_index, (detector_name, values) in enumerate(
+                f1.coincident_sipm_by_detector.items()):
+            safe_detector_name = ''.join(
+                character if character.isalnum() or character in '-_'
+                else '_'
+                for character in detector_name
+            )
+            detector_rate = f1.detector_count_rates[detector_name]
+            detector_accidental_rate = sum(
+                2.0 * detector_rate * other_rate
+                * f1.coincidence_window_ms / 1000.0
+                for other_name, other_rate in f1.detector_count_rates.items()
+                if other_name != detector_name
+            )
+            plot_coincident_sipm_langauss(
+                values=values,
+                live_time_s=f1.live_time_s,
+                detector_name=detector_name,
+                fit_range=(25.0, 200.0),
+                singles_values=f1.sipm[f1.detector_name == detector_name],
+                accidental_rate_hz=detector_accidental_rate,
+                color=detector_plot_colors[
+                    detector_index % len(detector_plot_colors)
+                ],
+                pdf_name=(
+                    pdf_file_location+'/'+infile_name
+                    +'_SiPM_coincident_'+safe_detector_name+'_Langau.pdf'
+                ),
+            )
 
     if f1.file_from_computer and f1.n_detector >= 2:
         plot_delta_t_histogram(
@@ -1155,7 +1558,7 @@ def main():
         axes[axis_index].errorbar(t, f1.binned_accel_y, yerr=accel_err, fmt='o-', color=mycolors[3], alpha=0.7, markersize=2, label='Ay')
         axes[axis_index].errorbar(t, f1.binned_accel_z, yerr=accel_err, fmt='o-', color=mycolors[1], alpha=0.7, markersize=2, label='Az')
         axes[axis_index].set_ylabel('Accel [g]')
-        axes[axis_index].legend(loc='upper right', fontsize=8)
+        axes[axis_index].legend(loc='upper right', fontsize=7, **LEGEND_STYLE)
         axis_index += 1
 
     # 6) Angular velocity (if present)
@@ -1165,7 +1568,7 @@ def main():
         axes[axis_index].errorbar(t, f1.binned_gyro_y, yerr=gyro_err, fmt='o-', color=mycolors[3], alpha=0.7, markersize=2, label='ωy')
         axes[axis_index].errorbar(t, f1.binned_gyro_z, yerr=gyro_err, fmt='o-', color=mycolors[1], alpha=0.7, markersize=2, label='ωz')
         axes[axis_index].set_ylabel('Gyro [°/s]')
-        axes[axis_index].legend(loc='upper right', fontsize=8)
+        axes[axis_index].legend(loc='upper right', fontsize=7, **LEGEND_STYLE)
 
     for axis in axes:
         axis.grid(True, which='both', linestyle='--', alpha=0.5)
