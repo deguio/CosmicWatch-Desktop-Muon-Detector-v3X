@@ -213,13 +213,15 @@ class CWClass():
         fileHandle.close()
         # Sensor columns are optional. Determine the layout from valid data rows,
         # ignoring comments, incomplete final rows and trailing tab characters.
-        supported_columns = (6, 9, 10, 13)
+        # The firmware may independently enable BMP280 (Temp/Press) and MPU6050
+        # (Accel/Gyro), so valid files are not limited to the old 6/10 layouts.
         column_counts = []
+        sample_fields = None
         for line in lineList[-200:]:
             stripped = line.rstrip('\t\r\n')
             if stripped and not stripped.lstrip().startswith('#'):
                 n_columns = len(stripped.split('\t'))
-                if n_columns in supported_columns:
+                if 6 <= n_columns <= 13:
                     column_counts.append(n_columns)
         if not column_counts:
             raise ValueError('No valid CosmicWatch event rows found in file')
@@ -227,15 +229,85 @@ class CWClass():
         number_of_columns = max(set(column_counts), key=column_counts.count)
         print('Number of columns in file: ', number_of_columns)
 
+        for line in lineList:
+            stripped = line.rstrip('\t\r\n')
+            if stripped and not stripped.lstrip().startswith('#'):
+                fields = stripped.split('\t')
+                if len(fields) == number_of_columns:
+                    sample_fields = fields
+                    break
+
+        event_headers = [
+            line for line in lineList
+            if line.lstrip().startswith('# Event') and 'Timestamp' in line
+        ]
+        event_header = event_headers[-1] if event_headers else ''
+
+        def looks_like_computer_metadata(fields):
+            if fields is None or len(fields) < 9:
+                return False
+            try:
+                time_parts = fields[-2].split(':')
+                date_parts = fields[-1].split('/')
+                return len(time_parts) == 3 and len(date_parts) == 3
+            except (AttributeError, ValueError):
+                return False
+
+        file_from_computer = looks_like_computer_metadata(sample_fields)
+        data_column_count = number_of_columns - (3 if file_from_computer else 0)
+        sensor_count = data_column_count - 6
+        if sensor_count < 0:
+            raise ValueError('CosmicWatch event rows contain fewer than 6 columns')
+
+        # Recover the sensor order from the firmware-generated header. This
+        # distinguishes, for example, an 8-column Temp/Press file from an
+        # 8-column Accel/Gyro file.
+        sensor_markers = {
+            'temperature': ('Temp[', 'Temperature['),
+            'pressure': ('Press[', 'Pressure['),
+            'accel': ('Accel(', 'Acceleration('),
+            'gyro': ('Gyro(', 'Gyroscope('),
+        }
+        sensor_positions = []
+        for sensor_name, markers in sensor_markers.items():
+            positions = [event_header.find(marker) for marker in markers]
+            positions = [position for position in positions if position >= 0]
+            if positions:
+                sensor_positions.append((min(positions), sensor_name))
+        sensor_names = [name for _, name in sorted(sensor_positions)]
+
+        # Header-less legacy files remain supported through the shape/content
+        # of their optional columns.
+        if len(sensor_names) != sensor_count:
+            sensor_values = sample_fields[6:data_column_count]
+            if sensor_count == 0:
+                sensor_names = []
+            elif sensor_count == 4:
+                sensor_names = ['temperature', 'pressure', 'accel', 'gyro']
+            elif sensor_count == 2 and all(':' in value for value in sensor_values):
+                sensor_names = ['accel', 'gyro']
+            elif sensor_count == 2:
+                sensor_names = ['temperature', 'pressure']
+            else:
+                raise ValueError(
+                    'Unable to identify the %d optional sensor column(s)'
+                    % sensor_count
+                )
+
+        if sensor_names:
+            print('  -> Sensor columns: ' + ', '.join(sensor_names))
+        else:
+            print('  -> No sensor columns')
+
         self.file_from_computer = False
         self.file_from_sdcard   = False
         self.has_MPU6050 = False
         self.has_BMP280 = False
         
-        if number_of_columns in (9, 13):
+        if file_from_computer:
             self.file_from_computer = True
             print('  -> File from Computer')
-            metadata_columns = (6, 7, 8) if number_of_columns == 9 else (10, 11, 12)
+            metadata_columns = tuple(range(data_column_count, number_of_columns))
             selected_columns = (0, 1, 2, 3, 4, 5, *metadata_columns)
             data = np.genfromtxt(
                 fname, dtype=str, delimiter='\t', comments='#',
@@ -254,7 +326,7 @@ class CWClass():
             comp_time = data[:,7]
             comp_date = data[:,8]
         
-        elif number_of_columns in (6, 10):
+        else:
             print('  -> File from MicroSD Card')
             self.file_from_sdcard = True
             data = np.genfromtxt(
@@ -284,23 +356,42 @@ class CWClass():
         gyro_y = missing_sensor_data.copy()
         gyro_z = missing_sensor_data.copy()
 
-        # Read sensor values only from the two legacy full layouts.
-        if number_of_columns in (10, 13):
+        if sensor_count:
             sensor_data = np.genfromtxt(
                 fname, dtype=str, delimiter='\t', comments='#',
-                usecols=(6, 7, 8, 9), invalid_raise=False
+                usecols=tuple(range(6, data_column_count)), invalid_raise=False
             )
-            sensor_data = np.atleast_2d(sensor_data)
-            temperature = sensor_data[:,0].astype(float)
-            pressure = sensor_data[:,1].astype(float)
+            sensor_data = np.asarray(sensor_data)
+            if sensor_data.ndim == 1:
+                sensor_data = sensor_data.reshape(
+                    (-1, 1) if sensor_count == 1 else (1, -1)
+                )
+            sensor_columns = {
+                name: sensor_data[:, index]
+                for index, name in enumerate(sensor_names)
+            }
 
             def split_xyz(values):
-                return np.asarray([value.split(':') for value in values], dtype=float).T
+                components = [value.split(':') for value in values]
+                if any(len(component) != 3 for component in components):
+                    raise ValueError('Invalid three-axis sensor value in data file')
+                return np.asarray(components, dtype=float).T
 
-            accel_x, accel_y, accel_z = split_xyz(sensor_data[:,2])
-            gyro_x, gyro_y, gyro_z = split_xyz(sensor_data[:,3])
-            self.has_MPU6050 = True
-            self.has_BMP280 = True
+            if 'temperature' in sensor_columns:
+                temperature = sensor_columns['temperature'].astype(float)
+            if 'pressure' in sensor_columns:
+                pressure = sensor_columns['pressure'].astype(float)
+            if 'accel' in sensor_columns:
+                accel_x, accel_y, accel_z = split_xyz(sensor_columns['accel'])
+            if 'gyro' in sensor_columns:
+                gyro_x, gyro_y, gyro_z = split_xyz(sensor_columns['gyro'])
+
+            self.has_BMP280 = (
+                'temperature' in sensor_columns and 'pressure' in sensor_columns
+            )
+            self.has_MPU6050 = (
+                'accel' in sensor_columns and 'gyro' in sensor_columns
+            )
 
         # Convert the computer time to an absolute time (MJD).
         if self.file_from_computer:
