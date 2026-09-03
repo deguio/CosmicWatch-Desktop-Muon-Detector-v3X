@@ -1282,7 +1282,7 @@ class NPlot():
 def plot_coincident_sipm_langauss(values, live_time_s, detector_name, pdf_name,
                                   fit_range=(25.0, 200.0), nbins=51,
                                   color='#c70039', singles_values=None,
-                                  accidental_rate_hz=0.0):
+                                  accidental_rate_hz=0.0, x_range=None):
     """Plot one detector's unique coincident pulses and fit Landau (x) Gaussian."""
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values) & (values > 0)]
@@ -1291,8 +1291,13 @@ def plot_coincident_sipm_langauss(values, live_time_s, detector_name, pdf_name,
               % detector_name)
         return None
 
-    xmin = max(float(np.min(values)) * 0.9, 0.1)
-    xmax = float(np.max(values)) * 1.1
+    if x_range is None:
+        xmin = max(float(np.min(values)) * 0.9, 0.1)
+        xmax = float(np.max(values)) * 1.1
+    else:
+        xmin, xmax = map(float, x_range)
+        if not np.isfinite(xmin) or not np.isfinite(xmax) or xmin <= 0 or xmax <= xmin:
+            raise ValueError('The shared SiPM x range must satisfy 0 < xmin < xmax')
     bins = np.logspace(np.log10(xmin), np.log10(xmax), nbins)
     counts, edges = np.histogram(values, bins=bins)
     rates = counts / live_time_s
@@ -1702,6 +1707,24 @@ def main():
     # Produce one dedicated, deduplicated Langau plot for each detector in the
     # time-coincidence sample.
     if f1.coincidence_source == 'time' and f1.coincident_sipm_by_detector:
+        # Define one common logarithmic range from the union of all coincident
+        # detector samples.  Passing it to every plot also gives them identical
+        # histogram bin edges, not only matching displayed axis limits.
+        shared_coincident_values = np.concatenate([
+            np.asarray(detector_values, dtype=float)
+            for detector_values in f1.coincident_sipm_by_detector.values()
+            if len(detector_values) > 0
+        ])
+        shared_coincident_values = shared_coincident_values[
+            np.isfinite(shared_coincident_values) & (shared_coincident_values > 0)
+        ]
+        shared_sipm_x_range = None
+        if len(shared_coincident_values) > 0:
+            shared_xmin = max(float(np.min(shared_coincident_values)) * 0.9, 0.1)
+            shared_xmax = float(np.max(shared_coincident_values)) * 1.1
+            if shared_xmax > shared_xmin:
+                shared_sipm_x_range = (shared_xmin, shared_xmax)
+
         for detector_index, (detector_name, values) in enumerate(
                 f1.coincident_sipm_by_detector.items()):
             safe_detector_name = ''.join(
@@ -1728,6 +1751,7 @@ def main():
                 fit_range=(25.0, 200.0),
                 singles_values=f1.sipm[f1.detector_name == detector_name],
                 accidental_rate_hz=detector_accidental_rate,
+                x_range=shared_sipm_x_range,
                 color=detector_plot_colors[
                     detector_index % len(detector_plot_colors)
                 ],
