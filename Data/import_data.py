@@ -49,8 +49,11 @@ def format_pc_timestamp(timestamp_ns):
     return comp_time, comp_date
 
 
-def build_output_row(raw_bytes, detector_name, timestamp_ns):
-    """Validate one serial event and add its software name and PC timestamp."""
+def build_output_row(raw_bytes, timestamp_ns):
+    """Validate an event, preserve its sensors and add PC metadata.
+
+    USB rows end with the detector name configured on the microSD card.
+    """
     raw_data = raw_bytes.decode(errors='replace').rstrip('\r\n\t')
     serial_data = raw_data.split('\t')
     try:
@@ -59,8 +62,64 @@ def build_output_row(raw_bytes, detector_name, timestamp_ns):
     except (ValueError, IndexError):
         return None
 
+    # Current firmware emits 7/9/11 USB fields: six core values,
+    # zero/two/four sensor values, and its configured detector name.
+    if len(serial_data) not in (7, 9, 11):
+        return None
+    sensor_values = serial_data[6:-1]
+    firmware_name = serial_data[-1].strip()
+    if not firmware_name:
+        return None
+
+    if len(sensor_values) == 0:
+        sensor_names = ()
+    elif len(sensor_values) == 2:
+        if all(':' in value for value in sensor_values):
+            sensor_names = ('accel', 'gyro')
+        else:
+            sensor_names = ('temperature', 'pressure')
+    elif len(sensor_values) == 4:
+        sensor_names = ('temperature', 'pressure', 'accel', 'gyro')
+    else:
+        return None
+
+    try:
+        if 'temperature' in sensor_names:
+            float(sensor_values[sensor_names.index('temperature')])
+            float(sensor_values[sensor_names.index('pressure')])
+        for vector_name in ('accel', 'gyro'):
+            if vector_name in sensor_names:
+                components = sensor_values[sensor_names.index(vector_name)].split(':')
+                if len(components) != 3:
+                    return None
+                for component in components:
+                    float(component)
+    except ValueError:
+        return None
+
     comp_time, comp_date = format_pc_timestamp(timestamp_ns)
-    return serial_data[:6] + [detector_name, comp_time, comp_date]
+    output_row = (
+        serial_data[:6] + sensor_values
+        + [firmware_name, comp_time, comp_date]
+    )
+    return output_row, sensor_names, firmware_name
+
+
+def output_header(sensor_names):
+    """Build a column header matching the sensor schema received over USB."""
+    labels = [
+        'Event', 'Timestamp[s]', 'Coincident[bool]', 'ADC[12b]',
+        'SiPM[mV]', 'Deadtime[s]',
+    ]
+    sensor_labels = {
+        'temperature': 'Temp[C]',
+        'pressure': 'Pressure[Pa]',
+        'accel': 'Accel(X:Y:Z)[g]',
+        'gyro': 'Gyro(X:Y:Z)[deg/sec]',
+    }
+    labels.extend(sensor_labels[name] for name in sensor_names)
+    labels.extend(['Name', 'Time', 'Date'])
+    return '# ' + '  '.join(labels)
 
 
 def read_detector(detector_index, connection, event_queue, stop_event):
@@ -140,33 +199,6 @@ elif '/' not in fname and '\\' not in fname:
     fname = os.path.join(cwd, fname)
 print(' -- Saving data to: '+fname)
 
-# Assign a unique software name to each selected USB port. This name replaces
-# the identical firmware default (for example "AxLab") in the output file.
-detector_name_list = []
-used_detector_names = set()
-print('\nAssign a name to each detector (names must be unique):')
-for i, port in enumerate(port_name_list):
-    default_name = 'Detector_%d' % (i + 1)
-    while True:
-        prompt = "  Name for %s (press Enter for %s): " % (port, default_name)
-        if sys.version_info[:3] > (3,0):
-            detector_name = input(prompt)
-        else:
-            detector_name = raw_input(prompt)
-        detector_name = detector_name.strip() or default_name
-        detector_name = detector_name.replace('\t', '_').replace('\r', '').replace('\n', '')
-        if detector_name in used_detector_names:
-            print("  Name '%s' is already in use. Choose a different name." % detector_name)
-            continue
-        detector_name_list.append(detector_name)
-        used_detector_names.add(detector_name)
-        break
-
-print('  Detector mapping:')
-for port, detector_name in zip(port_name_list, detector_name_list):
-    print('    %s -> %s' % (port, detector_name))
-
-
 print()
 detectors = []
 for i in range(nDetectors):
@@ -198,22 +230,15 @@ print(det_names)
 for i in range(len(det_names)):
     print("  "+str(i+1)+') '+det_names[i])
 '''
-# Start recording data to file.
-print("Taking data ...")
-if platform.system() == "Windows":
-    print("ctrl+break to termiante process")
-else:
-    print("Press ctl+c to terminate process")
+# Device names and sensor columns are announced together after every selected
+# USB port has delivered its first valid event.
+print("Waiting for data from the selected devices ...")
 
 file.write("###########################################################################################################################################################\n")
 
 file.write("#                                                          CosmicWatch: The Desktop Muon Detector v3X\n")
 file.write("#                                                                   Questions? saxani@udel.edu\n")
 file.write("# PC timestamp assigned immediately after receipt of each complete serial line\n")
-for port, detector_name in zip(port_name_list, detector_name_list):
-    file.write("# Detector alias: %s = %s\n" % (detector_name, port))
-file.write("# Event  Timestamp[s]  Coincident[bool]  ADC[12b]  SiPM[mV]  Deadtime[s]  Name  Time  Date\n")
-file.write("###########################################################################################################################################################\n")
 file.flush()
 
 # One dedicated reader per USB device. The main thread only serializes already
@@ -232,23 +257,100 @@ for detector_index, connection in enumerate(detectors):
     reader_threads.append(reader)
 
 last_flush = time.monotonic()
+record_separator = "#" * 155 + "\n"
+record_schema = None
+reported_schema_mismatches = set()
+firmware_name_by_detector = {}
+detector_index_by_firmware_name = {}
+reported_name_errors = set()
+acquisition_announced = False
 
 def write_queued_event(item):
+    global record_schema, acquisition_announced
     if item[0] == 'error':
         detector_index, error = item[1], item[2]
         print(
             'Serial connection lost for %s: %s'
-            % (detector_name_list[detector_index], error),
+            % (port_name_list[detector_index], error),
             file=sys.stderr,
         )
         return
 
     detector_index, received_ns, raw_bytes = item[1], item[2], item[3]
-    data = build_output_row(
-        raw_bytes, detector_name_list[detector_index], received_ns
-    )
-    if data is None:
+    parsed_event = build_output_row(raw_bytes, received_ns)
+    if parsed_event is None:
         return
+    data, sensor_names, firmware_name = parsed_event
+
+    known_name = firmware_name_by_detector.get(detector_index)
+    if known_name is None:
+        existing_detector = detector_index_by_firmware_name.get(firmware_name)
+        if existing_detector is not None and existing_detector != detector_index:
+            error_key = (detector_index, firmware_name)
+            if error_key not in reported_name_errors:
+                print(
+                    "Skipping %s: firmware name '%s' is already used by %s. "
+                    "Assign unique names in each microSD config file."
+                    % (
+                        port_name_list[detector_index], firmware_name,
+                        port_name_list[existing_detector],
+                    ),
+                    file=sys.stderr,
+                )
+                reported_name_errors.add(error_key)
+            return
+        firmware_name_by_detector[detector_index] = firmware_name
+        detector_index_by_firmware_name[firmware_name] = detector_index
+    elif firmware_name != known_name:
+        error_key = (detector_index, firmware_name)
+        if error_key not in reported_name_errors:
+            print(
+                "Skipping %s: firmware name changed from '%s' to '%s'"
+                % (port_name_list[detector_index], known_name, firmware_name),
+                file=sys.stderr,
+            )
+            reported_name_errors.add(error_key)
+        return
+
+    if record_schema is None:
+        record_schema = sensor_names
+        file.write(output_header(record_schema) + '\n')
+        file.write(record_separator)
+        file.flush()
+    elif sensor_names != record_schema:
+        mismatch = (firmware_name, sensor_names)
+        if mismatch not in reported_schema_mismatches:
+            print(
+                'Skipping events from %s: sensor columns %s do not match %s'
+                % (
+                    firmware_name,
+                    ', '.join(sensor_names) or 'none',
+                    ', '.join(record_schema) or 'none',
+                ),
+                file=sys.stderr,
+            )
+            reported_schema_mismatches.add(mismatch)
+        return
+
+    if (not acquisition_announced
+            and len(firmware_name_by_detector) == nDetectors):
+        print('\nDetected USB devices:')
+        for selected_index, port in enumerate(port_name_list):
+            print(
+                '  %s -> %s'
+                % (port, firmware_name_by_detector[selected_index])
+            )
+        print(
+            'USB sensor columns: '
+            + (', '.join(record_schema) if record_schema else 'none')
+        )
+        print('Taking data ...')
+        if platform.system() == 'Windows':
+            print('Press Ctrl+Break to terminate process')
+        else:
+            print('Press Ctrl+C to terminate process')
+        acquisition_announced = True
+
     line = '\t'.join(data)
     file.write(line + '\n')
     if PRINT_TO_SCREEN:

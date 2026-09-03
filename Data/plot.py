@@ -125,6 +125,62 @@ def unique_time_coincidence_pairs(timestamps_s, detector_names, window_ms=10.0):
     return unique_pairs
 
 
+def strict_all_detector_coincidence_groups(timestamps_s, detector_names,
+                                           window_ms=10.0):
+    """Return disjoint groups containing one event from every detector.
+
+    A group is accepted only when its full span, ``max(time) - min(time)``, is
+    no larger than ``window_ms``. Events are consumed chronologically and can
+    belong to at most one group.
+    """
+    timestamps_s = np.asarray(timestamps_s, dtype=float)
+    detector_names = np.asarray(detector_names, dtype=str)
+    if len(timestamps_s) != len(detector_names):
+        raise ValueError('Timestamps and detector names must have the same length')
+    if window_ms <= 0:
+        raise ValueError('The coincidence window must be greater than zero')
+
+    names = sorted(set(detector_names))
+    if len(names) < 2:
+        raise ValueError(
+            'Strict time coincidences require at least two different detector names'
+        )
+
+    window_s = window_ms / 1000.0
+    indices_by_name = {
+        name: np.flatnonzero(detector_names == name)[
+            np.argsort(timestamps_s[detector_names == name], kind='mergesort')
+        ]
+        for name in names
+    }
+    positions = {name: 0 for name in names}
+    groups = []
+
+    while all(positions[name] < len(indices_by_name[name]) for name in names):
+        group_indices = tuple(
+            int(indices_by_name[name][positions[name]]) for name in names
+        )
+        group_times = np.asarray(
+            [timestamps_s[index] for index in group_indices], dtype=float
+        )
+        earliest_time = float(np.min(group_times))
+        latest_time = float(np.max(group_times))
+
+        if latest_time - earliest_time <= window_s:
+            groups.append((group_indices, latest_time - earliest_time))
+            for name in names:
+                positions[name] += 1
+        else:
+            # Every future event is at least as late as the current head of its
+            # detector. Therefore an earliest head outside this span can never
+            # participate in a valid all-detector group and may be discarded.
+            for name, index in zip(names, group_indices):
+                if timestamps_s[index] == earliest_time:
+                    positions[name] += 1
+
+    return groups
+
+
 def cross_detector_time_differences(timestamps_s, detector_names, max_abs_ms=20.0):
     """Return signed time differences for every unordered detector pair.
 
@@ -198,15 +254,27 @@ def plot_delta_t_histogram(timestamps_s, detector_names, window_ms, max_abs_ms,
 
 class CWClass():
     def __init__(self, fname, bin_size=60, coincidence_source='device',
-                 coincidence_window_ms=10.0):
+                 coincidence_window_ms=10.0,
+                 time_coincidence_mode='pairwise'):
         self.name = fname.split('/')[-1]
         self.bin_size = bin_size
         self.coincidence_source = coincidence_source
         self.coincidence_window_ms = coincidence_window_ms
+        self.time_coincidence_mode = time_coincidence_mode
         self.coincidence_pair_count = None
         self.unique_coincidence_pairs = []
+        self.coincidence_groups = []
+        self.coincidence_group_count = None
         if coincidence_source not in ('device', 'time'):
             raise ValueError("coincidence_source must be 'device' or 'time'")
+        if time_coincidence_mode not in ('pairwise', 'all'):
+            raise ValueError(
+                "time_coincidence_mode must be 'pairwise' or 'all'"
+            )
+        if coincidence_source != 'time' and time_coincidence_mode != 'pairwise':
+            raise ValueError(
+                "time_coincidence_mode='all' requires coincidence_source='time'"
+            )
         
         fileHandle = open(fname,"r" )
         lineList = fileHandle.readlines()
@@ -418,21 +486,56 @@ class CWClass():
             self.n_detector       = len(set(detName))
 
             if coincidence_source == 'time':
-                coincident, self.coincidence_pair_count = time_coincidence_analysis(
-                    self.time_stamp_s, detName, coincidence_window_ms
-                )
-                self.unique_coincidence_pairs = unique_time_coincidence_pairs(
-                    self.time_stamp_s, detName, coincidence_window_ms
-                )
-                print(
-                    '  -> Coincidences calculated from computer Date/Time '
-                    'with a %.3f ms window' % coincidence_window_ms
-                )
-                print(
-                    '  -> %d unique one-to-one detector-pair matches '
-                    '(%d total pair associations)'
-                    % (len(self.unique_coincidence_pairs), self.coincidence_pair_count)
-                )
+                if time_coincidence_mode == 'pairwise':
+                    coincident, self.coincidence_pair_count = time_coincidence_analysis(
+                        self.time_stamp_s, detName, coincidence_window_ms
+                    )
+                    self.unique_coincidence_pairs = unique_time_coincidence_pairs(
+                        self.time_stamp_s, detName, coincidence_window_ms
+                    )
+                    print(
+                        '  -> Pairwise coincidences calculated from computer '
+                        'Date/Time with a %.3f ms window' % coincidence_window_ms
+                    )
+                    print(
+                        '  -> %d unique one-to-one detector-pair matches '
+                        '(%d total pair associations)'
+                        % (len(self.unique_coincidence_pairs), self.coincidence_pair_count)
+                    )
+                else:
+                    self.coincidence_groups = strict_all_detector_coincidence_groups(
+                        self.time_stamp_s, detName, coincidence_window_ms
+                    )
+                    self.coincidence_group_count = len(self.coincidence_groups)
+                    coincident = np.zeros(len(self.time_stamp_s), dtype=bool)
+                    for group_indices, _ in self.coincidence_groups:
+                        coincident[list(group_indices)] = True
+
+                    # Keep the pair representation available to the existing
+                    # per-detector spectrum code. All pairs here belong to a
+                    # rigorously accepted N-detector group.
+                    for group_indices, _ in self.coincidence_groups:
+                        for first_position in range(len(group_indices)):
+                            for second_position in range(
+                                    first_position + 1, len(group_indices)):
+                                first = group_indices[first_position]
+                                second = group_indices[second_position]
+                                delta_t = abs(
+                                    self.time_stamp_s[second]
+                                    - self.time_stamp_s[first]
+                                )
+                                self.unique_coincidence_pairs.append(
+                                    (first, second, delta_t)
+                                )
+                    print(
+                        '  -> Strict all-detector coincidences calculated from '
+                        'computer Date/Time with a %.3f ms maximum span'
+                        % coincidence_window_ms
+                    )
+                    print(
+                        '  -> %d disjoint %d-fold groups; no event reused'
+                        % (self.coincidence_group_count, self.n_detector)
+                    )
 
         elif coincidence_source == 'time':
             raise ValueError(
@@ -697,6 +800,10 @@ class CWClass():
         self.coincidence_pair_rate = None
         self.accidental_pair_rate = None
         self.corrected_pair_rate = None
+        self.coincidence_group_rate = None
+        self.coincidence_group_rate_err = None
+        self.accidental_group_rate = None
+        self.corrected_group_rate = None
         if self.file_from_computer:
             detector_names = sorted(set(detName))
             self.detector_count_rates = {
@@ -704,17 +811,42 @@ class CWClass():
                 for name in detector_names
             }
             if coincidence_source == 'time':
-                self.coincidence_pair_rate = self.coincidence_pair_count / self.live_time_s
                 window_s = coincidence_window_ms / 1000.0
-                self.accidental_pair_rate = sum(
-                    2.0 * self.detector_count_rates[detector_names[i]]
-                    * self.detector_count_rates[detector_names[j]] * window_s
-                    for i in range(len(detector_names))
-                    for j in range(i + 1, len(detector_names))
-                )
-                self.corrected_pair_rate = max(
-                    self.coincidence_pair_rate - self.accidental_pair_rate, 0.0
-                )
+                if time_coincidence_mode == 'pairwise':
+                    self.coincidence_pair_rate = (
+                        self.coincidence_pair_count / self.live_time_s
+                    )
+                    self.accidental_pair_rate = sum(
+                        2.0 * self.detector_count_rates[detector_names[i]]
+                        * self.detector_count_rates[detector_names[j]] * window_s
+                        for i in range(len(detector_names))
+                        for j in range(i + 1, len(detector_names))
+                    )
+                    self.corrected_pair_rate = max(
+                        self.coincidence_pair_rate - self.accidental_pair_rate,
+                        0.0,
+                    )
+                else:
+                    multiplicity = len(detector_names)
+                    self.coincidence_group_rate = (
+                        self.coincidence_group_count / self.live_time_s
+                    )
+                    self.coincidence_group_rate_err = (
+                        np.sqrt(self.coincidence_group_count) / self.live_time_s
+                    )
+                    # For independent, low-occupancy Poisson streams, the
+                    # relative-time volume satisfying max(t)-min(t) <= W is
+                    # N*W**(N-1). This reduces to 2*R1*R2*W for N=2.
+                    self.accidental_group_rate = (
+                        multiplicity
+                        * window_s ** (multiplicity - 1)
+                        * np.prod(list(self.detector_count_rates.values()))
+                    )
+                    self.corrected_group_rate = max(
+                        self.coincidence_group_rate
+                        - self.accidental_group_rate,
+                        0.0,
+                    )
 
         n = 4
         print("    -- Total Count Rate: ", np.round(self.total_counts/self.live_time_s,n),"+/-",
@@ -723,6 +855,21 @@ class CWClass():
         self.count_rate, self.count_rate_err = round(
                 self.total_counts/self.live_time_s, 
                 np.sqrt(self.total_counts)/self.live_time_s)
+
+        if (coincidence_source == 'time'
+                and time_coincidence_mode == 'all'):
+            print(
+                '    -- %d-fold group rate: %.6g Hz'
+                % (self.n_detector, self.coincidence_group_rate)
+            )
+            print(
+                '    -- Accidental %d-fold group rate: %.6g Hz'
+                % (self.n_detector, self.accidental_group_rate)
+            )
+            print(
+                '    -- Corrected %d-fold group rate: %.6g Hz'
+                % (self.n_detector, self.corrected_group_rate)
+            )
         
         
 
@@ -755,10 +902,28 @@ class CWClass():
         counts_coincident, _ = np.histogram(
             self.analysis_timestamp_s[self.select_coincident], bins=binEdges
         )
+        self.binned_coincidence_group_rate = None
+        self.binned_coincidence_group_rate_err = None
+        if (coincidence_source == 'time'
+                and time_coincidence_mode == 'all'):
+            group_timestamps = np.asarray([
+                np.mean(self.analysis_timestamp_s[list(group_indices)])
+                for group_indices, _ in self.coincidence_groups
+            ], dtype=float)
+            group_counts, _ = np.histogram(group_timestamps, bins=binEdges)
+            self.binned_coincidence_group_rate = group_counts / bin_livetime
+            self.binned_coincidence_group_rate_err = (
+                np.sqrt(group_counts) / bin_livetime
+            )
 
         self.total_coincident = int(np.count_nonzero(self.select_coincident))
         
-        print("    -- Count Rate Coincident (coincident): ",np.round(self.total_coincident/self.live_time_s,n),"+/-" ,
+        coincident_description = (
+            '%d-fold event rows' % self.n_detector
+            if coincidence_source == 'time' and time_coincidence_mode == 'all'
+            else 'coincident'
+        )
+        print("    -- Count Rate Coincident (%s): " % coincident_description,np.round(self.total_coincident/self.live_time_s,n),"+/-" ,
                     np.round(np.sqrt(self.total_coincident)/self.live_time_s,n),"Hz")
 
         self.count_rate_coincident, self.count_rate_err_coincident = round(
@@ -1387,11 +1552,25 @@ def main():
         help="Time coincidence window in milliseconds when --coincidence-source=time (default: 10)"
     )
     parser.add_argument(
+        '--time-coincidence-mode', choices=('pairwise', 'all'),
+        default='pairwise',
+        help=(
+            "With --coincidence-source=time, find independent detector pairs "
+            "or require one event from every detector inside the same window "
+            "(default: pairwise)"
+        ),
+    )
+    parser.add_argument(
         '--delta-t-range-ms', type=float, default=20.0,
         help="Half-range of the cross-detector delta-t histogram in ms (default: 20)"
     )
 
     args = parser.parse_args()
+    if (args.time_coincidence_mode == 'all'
+            and args.coincidence_source != 'time'):
+        parser.error(
+            '--time-coincidence-mode=all requires --coincidence-source=time'
+        )
 
     infile_name = args.input.split('/')[-1].split('.')[0]
     print("Plotting infile name: ", infile_name + '.txt')
@@ -1416,6 +1595,15 @@ def main():
         bin_size=args.bin_width,
         coincidence_source=args.coincidence_source,
         coincidence_window_ms=args.coincidence_window_ms,
+        time_coincidence_mode=args.time_coincidence_mode,
+    )
+    strict_all_mode = (
+        f1.coincidence_source == 'time'
+        and f1.time_coincidence_mode == 'all'
+    )
+    coincident_event_label = (
+        '%d-fold event rows' % f1.n_detector
+        if strict_all_mode else 'Coincident'
     )
 
     
@@ -1426,7 +1614,8 @@ def main():
         colors=[mycolors[7], mycolors[3],mycolors[1]],
         labels=[r'All Events:  ' + str(f1.count_rate) + '+/-' + str(f1.count_rate_err) +' Hz',
                 r'Non-Coincident:  ' + str(f1.count_rate_non_coincident) + '+/-' + str(f1.count_rate_err_non_coincident) +' Hz',
-                r'Coincident: ' + str(f1.count_rate_coincident) + '+/-' + str(f1.count_rate_err_coincident) +' Hz'],
+                coincident_event_label + ': ' + str(f1.count_rate_coincident)
+                + '+/-' + str(f1.count_rate_err_coincident) +' Hz'],
         xmin=None, xmax=None, ymin=None, ymax=None,nbins=101,yscale='log',xscale='log',
         xlabel='Meausred ADC peak value [0-4095]',
         pdf_name=pdf_file_location+'/'+infile_name+'_ADC.pdf',title = '')
@@ -1461,7 +1650,7 @@ def main():
         sipm_weights.append(f1.weights[f1.select_coincident])
         sipm_colors.append(mycolors[1])
         sipm_labels.append(
-            r'Coincident: ' + str(f1.count_rate_coincident) + '+/-'
+            coincident_event_label + ': ' + str(f1.count_rate_coincident) + '+/-'
             + str(f1.count_rate_err_coincident) +' Hz'
         )
         landau_fit_indices = [2]
@@ -1489,12 +1678,17 @@ def main():
                 for character in detector_name
             )
             detector_rate = f1.detector_count_rates[detector_name]
-            detector_accidental_rate = sum(
-                2.0 * detector_rate * other_rate
-                * f1.coincidence_window_ms / 1000.0
-                for other_name, other_rate in f1.detector_count_rates.items()
-                if other_name != detector_name
-            )
+            if strict_all_mode:
+                # Every accidental N-fold group contributes exactly one event
+                # to each detector's conditional spectrum.
+                detector_accidental_rate = f1.accidental_group_rate
+            else:
+                detector_accidental_rate = sum(
+                    2.0 * detector_rate * other_rate
+                    * f1.coincidence_window_ms / 1000.0
+                    for other_name, other_rate in f1.detector_count_rates.items()
+                    if other_name != detector_name
+                )
             plot_coincident_sipm_langauss(
                 values=values,
                 live_time_s=f1.live_time_s,
@@ -1526,21 +1720,46 @@ def main():
             '%s rate: %.4f Hz' % (name, rate)
             for name, rate in f1.detector_count_rates.items()
         )
-        rate_legend_extra.extend([
-            'Pair rate: %.4f Hz' % f1.coincidence_pair_rate,
-            r'$R_{acc}$ ($\pm$%.3g ms): %.4f Hz'
-            % (f1.coincidence_window_ms, f1.accidental_pair_rate),
-            'Corrected pair rate: %.4f Hz' % f1.corrected_pair_rate,
-        ])
+        if strict_all_mode:
+            rate_legend_extra.extend([
+                r'%d-fold $R_{acc}$ (span $\leq$ %.3g ms): %.4g Hz'
+                % (f1.n_detector, f1.coincidence_window_ms,
+                   f1.accidental_group_rate),
+                'Corrected %d-fold rate: %.4f Hz'
+                % (f1.n_detector, f1.corrected_group_rate),
+            ])
+        else:
+            rate_legend_extra.extend([
+                'Pair rate: %.4f Hz' % f1.coincidence_pair_rate,
+                r'$R_{acc}$ ($\pm$%.3g ms): %.4f Hz'
+                % (f1.coincidence_window_ms, f1.accidental_pair_rate),
+                'Corrected pair rate: %.4f Hz' % f1.corrected_pair_rate,
+            ])
+
+    if strict_all_mode:
+        plotted_coincidence_rate = f1.binned_coincidence_group_rate
+        plotted_coincidence_rate_err = f1.binned_coincidence_group_rate_err
+        plotted_coincidence_label = (
+            '%d-fold groups: %.4f+/-%.4f Hz'
+            % (f1.n_detector, f1.coincidence_group_rate,
+               f1.coincidence_group_rate_err)
+        )
+    else:
+        plotted_coincidence_rate = f1.binned_count_rate_coincident
+        plotted_coincidence_rate_err = f1.binned_count_rate_err_coincident
+        plotted_coincidence_label = (
+            'Coincident:  ' + str(f1.count_rate_coincident) + '+/-'
+            + str(f1.count_rate_err_coincident) + ' Hz'
+        )
 
     # Plot rate as a function of time
     c = ratePlot(time = [f1.binned_time_m,f1.binned_time_m,f1.binned_time_m],
-        count_rates = [f1.binned_count_rate,f1.binned_count_rate_non_coincident,f1.binned_count_rate_coincident],
-        count_rates_err = [f1.binned_count_rate_err,f1.binned_count_rate_err_non_coincident,f1.binned_count_rate_err_coincident], 
+        count_rates = [f1.binned_count_rate,f1.binned_count_rate_non_coincident,plotted_coincidence_rate],
+        count_rates_err = [f1.binned_count_rate_err,f1.binned_count_rate_err_non_coincident,plotted_coincidence_rate_err],
         colors=[mycolors[7], mycolors[3], mycolors[1]],
         labels=[r'All Events: ' + str(f1.count_rate) + '+/-' + str(f1.count_rate_err) +' Hz', 
                 r'Non-Coincident:  ' + str(f1.count_rate_non_coincident) + '+/-' + str(f1.count_rate_err_non_coincident) +' Hz',
-                r'Coincident:  ' + str(f1.count_rate_coincident) + '+/-' + str(f1.count_rate_err_coincident) +' Hz'],
+                plotted_coincidence_label],
         xmin = min(f1.binned_time_m), xmax = max(f1.binned_time_m),ymin = 0,ymax = 1.35*max(f1.binned_count_rate),
         figsize = [7,5],fmt = ['ko'],
         fontsize = 16,alpha = [1],
@@ -1626,7 +1845,11 @@ def main():
     # 1) Total rate
     axes[0].plot(t, f1.binned_count_rate, color=mycolors[7], label='All Events')
     axes[0].plot(t, f1.binned_count_rate_non_coincident, color=mycolors[3], label='Non-Coincident')
-    axes[0].plot(t, f1.binned_count_rate_coincident, color=mycolors[1], label='Coincident')
+    axes[0].plot(
+        t, plotted_coincidence_rate, color=mycolors[1],
+        label=('%d-fold groups' % f1.n_detector
+               if strict_all_mode else 'Coincident')
+    )
     axes[0].set_ylabel('Rate [Hz]')
     axes[0].legend(loc='upper right', fontsize=6)
     axes[0].grid(True, which='both', linestyle='--', alpha=0.5)
