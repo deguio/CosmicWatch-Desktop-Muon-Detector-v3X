@@ -276,9 +276,11 @@ class CWClass():
                 "time_coincidence_mode='all' requires coincidence_source='time'"
             )
         
-        fileHandle = open(fname,"r" )
-        lineList = fileHandle.readlines()
-        fileHandle.close()
+        # Take one immutable snapshot of the input.  The acquisition process may
+        # keep appending to the original file, but every column parsed below must
+        # come from this same set of lines.
+        with open(fname, "r") as fileHandle:
+            lineList = fileHandle.readlines()
         # Sensor columns are optional. Determine the layout from valid data rows,
         # ignoring comments, incomplete final rows and trailing tab characters.
         # The firmware may independently enable BMP280 (Temp/Press) and MPU6050
@@ -367,6 +369,56 @@ class CWClass():
         else:
             print('  -> No sensor columns')
 
+        def valid_snapshot_row(fields):
+            """Reject incomplete/malformed rows captured while the file grows."""
+            if len(fields) != number_of_columns:
+                return False
+            try:
+                float(fields[0])
+                float(fields[1])
+                float(fields[3])
+                float(fields[4])
+                float(fields[5])
+
+                for column_offset, sensor_name in enumerate(sensor_names):
+                    value = fields[6 + column_offset]
+                    if sensor_name in ('temperature', 'pressure'):
+                        float(value)
+                    else:
+                        components = value.split(':')
+                        if len(components) != 3:
+                            return False
+                        for component in components:
+                            float(component)
+
+                if file_from_computer:
+                    time_parts = fields[-2].split(':')
+                    date_parts = fields[-1].split('/')
+                    if len(time_parts) != 3 or len(date_parts) != 3:
+                        return False
+                    int(time_parts[0])
+                    int(time_parts[1])
+                    float(time_parts[2])
+                    int(date_parts[0])
+                    int(date_parts[1])
+                    int(date_parts[2])
+            except (TypeError, ValueError, IndexError):
+                return False
+            return True
+
+        snapshot_rows = []
+        for line in lineList:
+            stripped = line.rstrip('\t\r\n')
+            if not stripped or stripped.lstrip().startswith('#'):
+                continue
+            fields = stripped.split('\t')
+            if valid_snapshot_row(fields):
+                snapshot_rows.append(fields)
+
+        if not snapshot_rows:
+            raise ValueError('No complete CosmicWatch event rows found in file snapshot')
+        data = np.asarray(snapshot_rows, dtype=str)
+
         self.file_from_computer = False
         self.file_from_sdcard   = False
         self.has_MPU6050 = False
@@ -375,13 +427,6 @@ class CWClass():
         if file_from_computer:
             self.file_from_computer = True
             print('  -> File from Computer')
-            metadata_columns = tuple(range(data_column_count, number_of_columns))
-            selected_columns = (0, 1, 2, 3, 4, 5, *metadata_columns)
-            data = np.genfromtxt(
-                fname, dtype=str, delimiter='\t', comments='#',
-                usecols=selected_columns, invalid_raise=False
-            )
-            data = np.atleast_2d(data)
             event_number = data[:,0].astype(float) #first column of data
             PICO_timestamp_s = data[:,1].astype(float)
             coincident = np.array([
@@ -390,18 +435,13 @@ class CWClass():
             adc = data[:,3].astype(int)
             sipm = data[:,4].astype(float)
             deadtime = data[:,5].astype(float)
-            detName = data[:,6]
-            comp_time = data[:,7]
-            comp_date = data[:,8]
+            detName = data[:,data_column_count]
+            comp_time = data[:,data_column_count + 1]
+            comp_date = data[:,data_column_count + 2]
         
         else:
             print('  -> File from MicroSD Card')
             self.file_from_sdcard = True
-            data = np.genfromtxt(
-                fname, dtype=str, delimiter='\t', comments='#',
-                usecols=(0, 1, 2, 3, 4, 5), invalid_raise=False
-            )
-            data = np.atleast_2d(data)
             event_number = data[:,0].astype(float)#first column of data
             PICO_timestamp_s = data[:,1].astype(float)
             coincident = np.array([
@@ -425,15 +465,7 @@ class CWClass():
         gyro_z = missing_sensor_data.copy()
 
         if sensor_count:
-            sensor_data = np.genfromtxt(
-                fname, dtype=str, delimiter='\t', comments='#',
-                usecols=tuple(range(6, data_column_count)), invalid_raise=False
-            )
-            sensor_data = np.asarray(sensor_data)
-            if sensor_data.ndim == 1:
-                sensor_data = sensor_data.reshape(
-                    (-1, 1) if sensor_count == 1 else (1, -1)
-                )
+            sensor_data = data[:, 6:data_column_count]
             sensor_columns = {
                 name: sensor_data[:, index]
                 for index, name in enumerate(sensor_names)
