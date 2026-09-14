@@ -123,17 +123,19 @@ def output_header(sensor_names):
 
 
 def read_detector(detector_index, connection, event_queue, stop_event):
-    """Continuously read one USB device and timestamp each complete line immediately."""
+    """Read one USB device and timestamp the arrival of each line's first byte."""
     while not stop_event.is_set():
         try:
-            raw_bytes = connection.readline()
+            first_byte = connection.read(1)
+            if not first_byte:
+                continue
             received_ns = current_time_ns()
+            raw_bytes = first_byte + connection.read_until(b'\n')
         except (OSError, serial.SerialException) as error:
             if not stop_event.is_set():
                 event_queue.put(('error', detector_index, error))
             return
-        if raw_bytes:
-            event_queue.put(('event', detector_index, received_ns, raw_bytes))
+        event_queue.put(('event', detector_index, received_ns, raw_bytes))
 
 def serial_ports():
     if sys.platform.startswith('win'):
@@ -238,11 +240,11 @@ file.write("####################################################################
 
 file.write("#                                                          CosmicWatch: The Desktop Muon Detector v3X\n")
 file.write("#                                                                   Questions? saxani@udel.edu\n")
-file.write("# PC timestamp assigned immediately after receipt of each complete serial line\n")
+file.write("# PC timestamp assigned immediately after receipt of each serial line's first byte\n")
 file.flush()
 
-# One dedicated reader per USB device. The main thread only serializes already
-# timestamped rows to disk, so disk I/O never delays timestamp assignment.
+# One dedicated reader per USB device timestamps the first byte, then completes
+# the line. The main thread only serializes already timestamped rows to disk.
 event_queue = queue.Queue()
 stop_event = threading.Event()
 reader_threads = []
