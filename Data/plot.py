@@ -986,47 +986,80 @@ class CWClass():
                 self.total_non_coincident/self.live_time_s, 
                 np.sqrt(self.total_non_coincident)/self.live_time_s)
 
+        # Environmental and motion data are binned independently for every
+        # detector.  The combined curve is then the arithmetic mean of those
+        # detector means, so a higher event rate cannot give one device more
+        # weight than another.
+        if self.file_from_computer:
+            sensor_detector_masks = {
+                name: detName == name for name in sorted(set(detName))
+            }
+        else:
+            sensor_detector_masks = {
+                os.path.splitext(self.name)[0]: np.ones(len(event_number), dtype=bool)
+            }
+        self.sensor_detector_names = list(sensor_detector_masks)
+
+        def binned_sensor_by_detector(sensor_values):
+            sensor_values = np.asarray(sensor_values, dtype=float)
+            result = {}
+            for detector_name, detector_mask in sensor_detector_masks.items():
+                valid = detector_mask & np.isfinite(sensor_values)
+                sums, _ = np.histogram(
+                    self.analysis_timestamp_s[valid], bins=binEdges,
+                    weights=sensor_values[valid],
+                )
+                samples, _ = np.histogram(
+                    self.analysis_timestamp_s[valid], bins=binEdges,
+                )
+                means = np.full(len(samples), np.nan, dtype=float)
+                np.divide(sums, samples, out=means, where=samples > 0)
+                result[detector_name] = means
+            return result
+
+        def equal_detector_mean(series_by_detector):
+            stacked = np.asarray(list(series_by_detector.values()), dtype=float)
+            contributors = np.sum(np.isfinite(stacked), axis=0)
+            mean = np.full(stacked.shape[1], np.nan, dtype=float)
+            np.divide(
+                np.nansum(stacked, axis=0), contributors,
+                out=mean, where=contributors > 0,
+            )
+            return mean
+
+        self.binned_pressure_by_detector = {}
+        self.binned_temperature_by_detector = {}
+        self.binned_accel_x_by_detector = {}
+        self.binned_accel_y_by_detector = {}
+        self.binned_accel_z_by_detector = {}
+        self.binned_gyro_x_by_detector = {}
+        self.binned_gyro_y_by_detector = {}
+        self.binned_gyro_z_by_detector = {}
+
         if self.has_BMP280:
-            sum_pressure, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.pressure)
-            count_pressure, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
-            self.binned_pressure = sum_pressure / np.maximum(count_pressure, 1)
+            self.binned_pressure_by_detector = binned_sensor_by_detector(self.pressure)
+            self.binned_temperature_by_detector = binned_sensor_by_detector(self.temperature)
+            self.binned_pressure = equal_detector_mean(
+                self.binned_pressure_by_detector
+            )
+            self.binned_temperature = equal_detector_mean(
+                self.binned_temperature_by_detector
+            )
 
-            # Bin the temperature by taking the average temperature in each bin
-            sum_temperature, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.temperature)
-            count_temperature, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
-            self.binned_temperature = sum_temperature / np.maximum(count_temperature, 1)
-
-        
         if self.has_MPU6050:
-            # Bin the temperature by taking the average temperature in each bin
-            sum_accel_x, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.accel_x)
-            count_accel_x, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
-            self.binned_accel_x = sum_accel_x / np.maximum(count_accel_x, 1)  # Avoid division by zero
+            self.binned_accel_x_by_detector = binned_sensor_by_detector(self.accel_x)
+            self.binned_accel_y_by_detector = binned_sensor_by_detector(self.accel_y)
+            self.binned_accel_z_by_detector = binned_sensor_by_detector(self.accel_z)
+            self.binned_gyro_x_by_detector = binned_sensor_by_detector(self.gyro_x)
+            self.binned_gyro_y_by_detector = binned_sensor_by_detector(self.gyro_y)
+            self.binned_gyro_z_by_detector = binned_sensor_by_detector(self.gyro_z)
 
-            # Bin the temperature by taking the average temperature in each bin
-            sum_accel_y, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.accel_y)
-            count_accel_y, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
-            self.binned_accel_y = sum_accel_y / np.maximum(count_accel_y, 1)  # Avoid division by zero
-
-            # Bin the temperature by taking the average temperature in each bin
-            sum_accel_z, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.accel_z)
-            count_accel_z, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
-            self.binned_accel_z = sum_accel_z / np.maximum(count_accel_z, 1)  # Avoid division by zero
-
-            # Bin the temperature by taking the average temperature in each bin
-            sum_gyro_x, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.gyro_x)
-            count_gyro_x, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
-            self.binned_gyro_x = sum_gyro_x / np.maximum(count_gyro_x, 1)  # Avoid division by zero
-
-            # Bin the temperature by taking the average temperature in each bin
-            sum_gyro_y, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.gyro_y)
-            count_gyro_y, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
-            self.binned_gyro_y = sum_gyro_y / np.maximum(count_gyro_y, 1)  # Avoid division by zero
-
-            # Bin the temperature by taking the average temperature in each bin
-            sum_gyro_z, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges, weights=self.gyro_z)
-            count_gyro_z, _ = np.histogram(self.analysis_timestamp_s, bins=binEdges)
-            self.binned_gyro_z = sum_gyro_z / np.maximum(count_gyro_z, 1)  # Avoid division by zero
+            self.binned_accel_x = equal_detector_mean(self.binned_accel_x_by_detector)
+            self.binned_accel_y = equal_detector_mean(self.binned_accel_y_by_detector)
+            self.binned_accel_z = equal_detector_mean(self.binned_accel_z_by_detector)
+            self.binned_gyro_x = equal_detector_mean(self.binned_gyro_x_by_detector)
+            self.binned_gyro_y = equal_detector_mean(self.binned_gyro_y_by_detector)
+            self.binned_gyro_z = equal_detector_mean(self.binned_gyro_z_by_detector)
 
             
             # Coincident binned data
@@ -1575,7 +1608,76 @@ class ratePlot():
             print('Saving Figure to: '+os.getcwd() +  '/'+pdf_name)
             plt.savefig(pdf_name, format='pdf',transparent =True)
         plt.show()
-        
+
+
+def draw_scalar_detector_curves(ax, time_minutes, series_by_detector,
+                                equal_weight_mean, quantity_label,
+                                value_scale=1.0):
+    """Draw one scalar sensor curve per detector plus their equal-weight mean."""
+    for detector_index, (detector_name, values) in enumerate(
+            series_by_detector.items()):
+        ax.plot(
+            time_minutes, np.asarray(values) * value_scale,
+            marker='o', markersize=2, linewidth=1.1, alpha=0.7,
+            color=mycolors[detector_index % len(mycolors)],
+            label='%s %s' % (quantity_label, detector_name),
+        )
+    if len(series_by_detector) > 1:
+        ax.plot(
+            time_minutes, np.asarray(equal_weight_mean) * value_scale,
+            color='black', linewidth=3.0, zorder=10,
+            label='Mean (equal detector weight)',
+        )
+
+
+def draw_vector_detector_curves(ax, time_minutes, component_series,
+                                component_means, quantity_label):
+    """Draw X/Y/Z for each detector and thick black component means."""
+    component_styles = {'X': '-', 'Y': '--', 'Z': ':'}
+    detector_names = list(next(iter(component_series.values())).keys())
+    for detector_index, detector_name in enumerate(detector_names):
+        detector_color = mycolors[detector_index % len(mycolors)]
+        for component_name, series_by_detector in component_series.items():
+            ax.plot(
+                time_minutes, series_by_detector[detector_name],
+                color=detector_color,
+                linestyle=component_styles[component_name],
+                linewidth=1.1, alpha=0.65,
+                label='%s %s %s'
+                      % (quantity_label, component_name, detector_name),
+            )
+    if len(detector_names) > 1:
+        for component_name, mean_values in component_means.items():
+            ax.plot(
+                time_minutes, mean_values, color='black',
+                linestyle=component_styles[component_name],
+                linewidth=3.0, zorder=10,
+                label='Mean %s (equal detector weight)' % component_name,
+            )
+
+
+def save_sensor_figure(draw_function, ylabel, pdf_name, ylim=None):
+    """Apply common styling and save an environmental/motion sensor figure."""
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    draw_function(ax)
+    ax.set_xlabel('Time [min]')
+    ax.set_ylabel(ylabel)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.grid(which='both', linestyle='--', alpha=0.5)
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(
+        handles, labels,
+        fontsize=DENSE_LEGEND_FONTSIZE,
+        ncol=2 if len(labels) > 6 else 1,
+        **LEGEND_STYLE,
+    )
+    fig.tight_layout()
+    print('Saving Figure to: ' + os.getcwd() + '/' + pdf_name)
+    fig.savefig(pdf_name, format='pdf', transparent=True)
+    plt.show()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Process CosmicWatch data.")
     parser.add_argument('-i', '--input', required=True, help="Input file name or full path")
@@ -1836,46 +1938,66 @@ def main():
 
 
     if f1.has_BMP280:
-        c = ratePlot(time = [f1.binned_time_m,],
-            count_rates = [f1.binned_pressure],
-            count_rates_err = [np.ones(len(f1.binned_pressure)) * 100],
-            colors =[mycolors[6]],
-            xmin = min(f1.binned_time_m),xmax = max(f1.binned_time_m),ymin = min(f1.binned_pressure)-500,ymax =max(f1.binned_pressure)+500,
-            figsize = [7,5],labels=['Pressure Data'],
-            fontsize = 16,alpha = [1],fmt = ['ko'],
-            xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = r'Pressure [Pa]',
-            loc = 3,pdf_name=pdf_file_location+'/'+infile_name+'_pressure.pdf',title = '')
+        save_sensor_figure(
+            lambda ax: draw_scalar_detector_curves(
+                ax, f1.binned_time_m,
+                f1.binned_pressure_by_detector, f1.binned_pressure,
+                'Pressure',
+            ),
+            ylabel='Pressure [Pa]',
+            pdf_name=pdf_file_location+'/'+infile_name+'_pressure.pdf',
+        )
 
-        c = ratePlot(time = [f1.binned_time_m,],
-            count_rates = [f1.binned_temperature],
-            count_rates_err = [np.ones(len(f1.binned_temperature))*0.1],
-            colors =[mycolors[5]],
-            xmin = min(f1.binned_time_m),xmax = max(f1.binned_time_m),ymin = min(f1.binned_temperature)-0.4,ymax = max(f1.binned_temperature)+0.4,
-            figsize = [7,5],fmt = ['ko'],
-            fontsize = 16,alpha = [1],labels=['Temperature Data'],
-            xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = r'Temperature [$^{\circ}$C]',
-            loc = 3,pdf_name=pdf_file_location+'/'+infile_name+'_temperature.pdf',title = '')
+        save_sensor_figure(
+            lambda ax: draw_scalar_detector_curves(
+                ax, f1.binned_time_m,
+                f1.binned_temperature_by_detector, f1.binned_temperature,
+                'Temperature',
+            ),
+            ylabel=r'Temperature [$^{\circ}$C]',
+            pdf_name=pdf_file_location+'/'+infile_name+'_temperature.pdf',
+        )
 
     if f1.has_MPU6050:
-        c = ratePlot(time = [f1.binned_time_m,f1.binned_time_m,f1.binned_time_m,],
-            count_rates = [f1.binned_accel_z,f1.binned_accel_y,f1.binned_accel_x],
-            count_rates_err = [np.ones(len(f1.binned_accel_z))*0.001,np.ones(len(f1.binned_accel_z))*0.001,np.ones(len(f1.binned_accel_z))*0.001], # Uncertainty on pressure is 0.1C
-            colors=[mycolors[7], mycolors[3], mycolors[1]],
-            xmin = min(f1.binned_time_m),xmax = max(f1.binned_time_m),ymin = -1.3,ymax = 1.3,#ymin = min(f1.binned_accel_z)-0.001,ymax = max(f1.binned_accel_z)+0.001,
-            figsize = [7,5], fmt=['go-','ro-','bo-'],
-            fontsize = 16,alpha = [0.3,0.3,0.3],labels=['Acceleration Z Data','Acceleration Y Data','Acceleration X Data'],
-            xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = "Averaged Instantaneous \n Linear Acceleration [g]",
-            loc = 4,pdf_name=pdf_file_location+'/'+infile_name+'_accel.pdf',title = '')
+        save_sensor_figure(
+            lambda ax: draw_vector_detector_curves(
+                ax, f1.binned_time_m,
+                {
+                    'X': f1.binned_accel_x_by_detector,
+                    'Y': f1.binned_accel_y_by_detector,
+                    'Z': f1.binned_accel_z_by_detector,
+                },
+                {
+                    'X': f1.binned_accel_x,
+                    'Y': f1.binned_accel_y,
+                    'Z': f1.binned_accel_z,
+                },
+                'Acceleration',
+            ),
+            ylabel='Linear acceleration [g]',
+            pdf_name=pdf_file_location+'/'+infile_name+'_accel.pdf',
+            ylim=(-1.3, 1.3),
+        )
 
-        c = ratePlot(time = [f1.binned_time_m,f1.binned_time_m,f1.binned_time_m,],
-            count_rates = [f1.binned_gyro_z,f1.binned_gyro_y,f1.binned_gyro_x],
-            count_rates_err = [np.ones(len(f1.binned_gyro_z))*0.1,np.ones(len(f1.binned_gyro_y))*0.1,np.ones(len(f1.binned_gyro_x))*0.1], # Uncertainty on pressure is 0.1C
-            colors=[mycolors[7], mycolors[3], mycolors[1]],
-            xmin = min(f1.binned_time_m),xmax = max(f1.binned_time_m),ymin = -100,ymax = 100,
-            figsize = [7,5],fmt=['go-','ro-','bo-'],
-            fontsize = 16,alpha = [0.3,0.3,0.3],labels=['Gyro Z Data','Gyro Y Data','Gyro X Data'],
-            xscale = 'linear',yscale = 'linear',xlabel = 'Time [min]',ylabel = "Averaged Instantaneous \n Angular Velocity [deg/s]",
-            loc = 4,pdf_name=pdf_file_location+'/'+infile_name+'_gyro.pdf',title = '')
+        save_sensor_figure(
+            lambda ax: draw_vector_detector_curves(
+                ax, f1.binned_time_m,
+                {
+                    'X': f1.binned_gyro_x_by_detector,
+                    'Y': f1.binned_gyro_y_by_detector,
+                    'Z': f1.binned_gyro_z_by_detector,
+                },
+                {
+                    'X': f1.binned_gyro_x,
+                    'Y': f1.binned_gyro_y,
+                    'Z': f1.binned_gyro_z,
+                },
+                'Gyro',
+            ),
+            ylabel='Angular velocity [deg/s]',
+            pdf_name=pdf_file_location+'/'+infile_name+'_gyro.pdf',
+            ylim=(-100, 100),
+        )
 
     t = f1.binned_time_m  # shared x-axis (Time [min])
 
@@ -1913,32 +2035,68 @@ def main():
 
     axis_index = 1
     if f1.has_BMP280:
-        axes[axis_index].plot(t, f1.binned_pressure/1000., 'o-', color=mycolors[6])
+        draw_scalar_detector_curves(
+            axes[axis_index], t,
+            f1.binned_pressure_by_detector, f1.binned_pressure,
+            'Pressure', value_scale=1.0/1000.0,
+        )
         axes[axis_index].set_ylabel('Pressure [kPa]')
+        axes[axis_index].legend(fontsize=6, **LEGEND_STYLE)
         axis_index += 1
 
-        axes[axis_index].plot(t, f1.binned_temperature, 'o-', color=mycolors[5])
+        draw_scalar_detector_curves(
+            axes[axis_index], t,
+            f1.binned_temperature_by_detector, f1.binned_temperature,
+            'Temperature',
+        )
         axes[axis_index].set_ylabel('Temperature [°C]')
+        axes[axis_index].legend(fontsize=6, **LEGEND_STYLE)
         axis_index += 1
 
     # 5) Acceleration (if present)
     if f1.has_MPU6050:
-        accel_err = np.full_like(f1.binned_accel_x, 0.001)  # Example 1 mg uncertainty
-        axes[axis_index].errorbar(t, f1.binned_accel_x, yerr=accel_err, fmt='o-', color=mycolors[7], alpha=0.7, markersize=2, label='Ax')
-        axes[axis_index].errorbar(t, f1.binned_accel_y, yerr=accel_err, fmt='o-', color=mycolors[3], alpha=0.7, markersize=2, label='Ay')
-        axes[axis_index].errorbar(t, f1.binned_accel_z, yerr=accel_err, fmt='o-', color=mycolors[1], alpha=0.7, markersize=2, label='Az')
+        draw_vector_detector_curves(
+            axes[axis_index], t,
+            {
+                'X': f1.binned_accel_x_by_detector,
+                'Y': f1.binned_accel_y_by_detector,
+                'Z': f1.binned_accel_z_by_detector,
+            },
+            {
+                'X': f1.binned_accel_x,
+                'Y': f1.binned_accel_y,
+                'Z': f1.binned_accel_z,
+            },
+            'Acceleration',
+        )
         axes[axis_index].set_ylabel('Accel [g]')
-        axes[axis_index].legend(loc='upper right', fontsize=7, **LEGEND_STYLE)
+        axes[axis_index].set_ylim(-1.3, 1.3)
+        axes[axis_index].legend(
+            loc='upper right', fontsize=6, ncol=2, **LEGEND_STYLE
+        )
         axis_index += 1
 
     # 6) Angular velocity (if present)
     if f1.has_MPU6050:
-        gyro_err = np.full_like(f1.binned_gyro_x, 0.1)  # Example 0.1°/s uncertainty
-        axes[axis_index].errorbar(t, f1.binned_gyro_x, yerr=gyro_err, fmt='o-', color=mycolors[7], alpha=0.7, markersize=2, label='ωx')
-        axes[axis_index].errorbar(t, f1.binned_gyro_y, yerr=gyro_err, fmt='o-', color=mycolors[3], alpha=0.7, markersize=2, label='ωy')
-        axes[axis_index].errorbar(t, f1.binned_gyro_z, yerr=gyro_err, fmt='o-', color=mycolors[1], alpha=0.7, markersize=2, label='ωz')
+        draw_vector_detector_curves(
+            axes[axis_index], t,
+            {
+                'X': f1.binned_gyro_x_by_detector,
+                'Y': f1.binned_gyro_y_by_detector,
+                'Z': f1.binned_gyro_z_by_detector,
+            },
+            {
+                'X': f1.binned_gyro_x,
+                'Y': f1.binned_gyro_y,
+                'Z': f1.binned_gyro_z,
+            },
+            'Gyro',
+        )
         axes[axis_index].set_ylabel('Gyro [°/s]')
-        axes[axis_index].legend(loc='upper right', fontsize=7, **LEGEND_STYLE)
+        axes[axis_index].set_ylim(-100, 100)
+        axes[axis_index].legend(
+            loc='upper right', fontsize=6, ncol=2, **LEGEND_STYLE
+        )
 
     for axis in axes:
         axis.grid(True, which='both', linestyle='--', alpha=0.5)
