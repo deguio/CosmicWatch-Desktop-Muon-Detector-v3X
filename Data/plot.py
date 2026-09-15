@@ -9,6 +9,21 @@ from scipy.signal import fftconvolve
 from scipy.stats import landau
 import numpy as np
 
+try:
+    from .temporal_groups import (
+        coincidences_from_computer_time,
+        strict_all_detector_coincidence_groups,
+        time_coincidence_analysis,
+        unique_time_coincidence_pairs,
+    )
+except ImportError:  # Esecuzione diretta: python Data/plot.py
+    from temporal_groups import (
+        coincidences_from_computer_time,
+        strict_all_detector_coincidence_groups,
+        time_coincidence_analysis,
+        unique_time_coincidence_pairs,
+    )
+
 
 warnings.filterwarnings('ignore')
 
@@ -41,145 +56,6 @@ LEGEND_STYLE = {
 # Mode of scipy.stats.landau in its standardized parametrization.  Including
 # this offset makes the fitted ``mpv`` parameter the actual distribution peak.
 LANDAU_STANDARD_MODE = -0.4293145383
-
-def time_coincidence_analysis(timestamps_s, detector_names, window_ms=10.0):
-    """Return the coincident-event mask and number of cross-detector pairs."""
-    timestamps_s = np.asarray(timestamps_s, dtype=float)
-    detector_names = np.asarray(detector_names, dtype=str)
-    if len(timestamps_s) != len(detector_names):
-        raise ValueError('Timestamps and detector names must have the same length')
-    if window_ms <= 0:
-        raise ValueError('The coincidence window must be greater than zero')
-    if len(set(detector_names)) < 2:
-        raise ValueError(
-            'Time-based coincidences require at least two different detector names'
-        )
-
-    window_s = window_ms / 1000.0
-    coincident = np.zeros(len(timestamps_s), dtype=bool)
-    pair_count = 0
-    order = np.argsort(timestamps_s, kind='mergesort')
-    sorted_times = timestamps_s[order]
-    sorted_names = detector_names[order]
-
-    left = 0
-    for right in range(len(order)):
-        while sorted_times[right] - sorted_times[left] > window_s:
-            left += 1
-        for candidate in range(left, right):
-            if sorted_names[candidate] != sorted_names[right]:
-                coincident[order[candidate]] = True
-                coincident[order[right]] = True
-                pair_count += 1
-
-    return coincident, pair_count
-
-
-def coincidences_from_computer_time(timestamps_s, detector_names, window_ms=10.0):
-    """Mark events from different detectors separated by at most ``window_ms``."""
-    return time_coincidence_analysis(timestamps_s, detector_names, window_ms)[0]
-
-
-def unique_time_coincidence_pairs(timestamps_s, detector_names, window_ms=10.0):
-    """Build closest one-to-one matches independently for each detector pair."""
-    timestamps_s = np.asarray(timestamps_s, dtype=float)
-    detector_names = np.asarray(detector_names, dtype=str)
-    if len(timestamps_s) != len(detector_names):
-        raise ValueError('Timestamps and detector names must have the same length')
-    if window_ms <= 0:
-        raise ValueError('The coincidence window must be greater than zero')
-
-    window_s = window_ms / 1000.0
-    names = sorted(set(detector_names))
-    unique_pairs = []
-    for name_index, name_a in enumerate(names):
-        indices_a = np.where(detector_names == name_a)[0]
-        indices_a = indices_a[np.argsort(timestamps_s[indices_a], kind='mergesort')]
-        for name_b in names[name_index + 1:]:
-            indices_b = np.where(detector_names == name_b)[0]
-            indices_b = indices_b[np.argsort(timestamps_s[indices_b], kind='mergesort')]
-            times_b = timestamps_s[indices_b]
-            candidates = []
-            for index_a in indices_a:
-                time_a = timestamps_s[index_a]
-                first = np.searchsorted(times_b, time_a - window_s, side='left')
-                last = np.searchsorted(times_b, time_a + window_s, side='right')
-                for position_b in range(first, last):
-                    index_b = int(indices_b[position_b])
-                    candidates.append((
-                        abs(timestamps_s[index_b] - time_a),
-                        int(index_a), index_b,
-                    ))
-
-            # Events cannot be reused within the same detector pair. They may
-            # still participate in a different detector pair (a valid triple or
-            # higher-order coincidence).
-            used_a = set()
-            used_b = set()
-            for delta_t, index_a, index_b in sorted(candidates):
-                if index_a in used_a or index_b in used_b:
-                    continue
-                used_a.add(index_a)
-                used_b.add(index_b)
-                unique_pairs.append((index_a, index_b, delta_t))
-    return unique_pairs
-
-
-def strict_all_detector_coincidence_groups(timestamps_s, detector_names,
-                                           window_ms=10.0):
-    """Return disjoint groups containing one event from every detector.
-
-    A group is accepted only when its full span, ``max(time) - min(time)``, is
-    no larger than ``window_ms``. Events are consumed chronologically and can
-    belong to at most one group.
-    """
-    timestamps_s = np.asarray(timestamps_s, dtype=float)
-    detector_names = np.asarray(detector_names, dtype=str)
-    if len(timestamps_s) != len(detector_names):
-        raise ValueError('Timestamps and detector names must have the same length')
-    if window_ms <= 0:
-        raise ValueError('The coincidence window must be greater than zero')
-
-    names = sorted(set(detector_names))
-    if len(names) < 2:
-        raise ValueError(
-            'Strict time coincidences require at least two different detector names'
-        )
-
-    window_s = window_ms / 1000.0
-    indices_by_name = {
-        name: np.flatnonzero(detector_names == name)[
-            np.argsort(timestamps_s[detector_names == name], kind='mergesort')
-        ]
-        for name in names
-    }
-    positions = {name: 0 for name in names}
-    groups = []
-
-    while all(positions[name] < len(indices_by_name[name]) for name in names):
-        group_indices = tuple(
-            int(indices_by_name[name][positions[name]]) for name in names
-        )
-        group_times = np.asarray(
-            [timestamps_s[index] for index in group_indices], dtype=float
-        )
-        earliest_time = float(np.min(group_times))
-        latest_time = float(np.max(group_times))
-
-        if latest_time - earliest_time <= window_s:
-            groups.append((group_indices, latest_time - earliest_time))
-            for name in names:
-                positions[name] += 1
-        else:
-            # Every future event is at least as late as the current head of its
-            # detector. Therefore an earliest head outside this span can never
-            # participate in a valid all-detector group and may be discarded.
-            for name, index in zip(names, group_indices):
-                if timestamps_s[index] == earliest_time:
-                    positions[name] += 1
-
-    return groups
-
 
 def cross_detector_time_differences(timestamps_s, detector_names, max_abs_ms=20.0):
     """Return signed time differences for every unordered detector pair.

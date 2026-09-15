@@ -25,11 +25,9 @@ evento, Home/End per andare al primo/ultimo evento e q per chiudere.
 from __future__ import annotations
 
 import argparse
-import bisect
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date
-from itertools import product
 from pathlib import Path
 import sys
 
@@ -39,6 +37,19 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Rectangle
 import numpy as np
+
+try:
+    from .temporal_groups import (
+        build_reference_groups,
+        find_compact_groups,
+        match_probe_to_groups,
+    )
+except ImportError:  # Esecuzione diretta: python Data/display.py
+    from temporal_groups import (
+        build_reference_groups,
+        find_compact_groups,
+        match_probe_to_groups,
+    )
 
 
 DEVICE_NAMES = (
@@ -236,185 +247,32 @@ def load_hits(path: Path, min_sipm_mv: float = 0.0) -> tuple[list[Hit], int]:
 def find_coincidences(
     hits: list[Hit], window_ms: float = 1.0, min_devices: int = 2
 ) -> list[Coincidence]:
-    """Seleziona gruppi unici privilegiando molteplicità e compattezza.
-
-    Vengono generati tutti i candidati temporalmente contigui con span non
-    superiore a ``window``. I candidati sono ordinati mediante un punteggio che
-    premia device differenti e penalizza la dispersione dalla mediana. Quelli
-    migliori acquisiscono per primi i propri hit, che non possono essere
-    riutilizzati. In questo modo un hit vicino al centro di un evento successivo
-    non viene consumato automaticamente dalla prima finestra compatibile.
-    """
-    if window_ms <= 0:
-        raise ValueError("--window-ms deve essere maggiore di zero")
+    """Adatta i gruppi temporali condivisi agli oggetti ``Hit`` del display."""
     if not 2 <= min_devices <= len(DEVICE_NAMES):
         raise ValueError("--min-devices deve essere compreso tra 2 e 9")
-
-    window_ns = round(window_ms * 1e6)
-    timing_scale_ns = window_ns / 4.0
-    candidate_by_hits: dict[frozenset[Hit], tuple[float, Coincidence]] = {}
-
-    for first in range(len(hits)):
-        last = first + 1
-        while last < len(hits) and hits[last].time_ns - hits[first].time_ns <= window_ns:
-            last += 1
-        for stop in range(first + 2, last + 1):
-            interval_hits = hits[first:stop]
-            median_ns = float(np.median([hit.time_ns for hit in interval_hits]))
-            best_by_device: dict[str, Hit] = {}
-            for hit in interval_hits:
-                previous = best_by_device.get(hit.device)
-                if (
-                    previous is None
-                    or abs(hit.time_ns - median_ns) < abs(previous.time_ns - median_ns)
-                ):
-                    best_by_device[hit.device] = hit
-            if len(best_by_device) < min_devices:
-                continue
-
-            selected_hits = tuple(sorted(
-                best_by_device.values(), key=lambda hit: hit.time_ns
-            ))
-            selected_times = np.asarray(
-                [hit.time_ns for hit in selected_hits], dtype=float
-            )
-            selected_median = float(np.median(selected_times))
-            normalized_mean_square = float(np.mean(
-                ((selected_times - selected_median) / timing_scale_ns) ** 2
-            ))
-            # Un gruppo molto compatto ad alta molteplicità prevale, mentre un
-            # candidato largo formato dall'unione di due picchi vicini perde
-            # contro i due picchi presi separatamente.
-            score = len(selected_hits) / (1.0 + normalized_mean_square)
-            key = frozenset(selected_hits)
-            previous_candidate = candidate_by_hits.get(key)
-            event = Coincidence(selected_hits)
-            if previous_candidate is None or score > previous_candidate[0]:
-                candidate_by_hits[key] = (score, event)
-
-    ranked_candidates = sorted(
-        candidate_by_hits.values(),
-        key=lambda item: (-item[0], -item[1].multiplicity, item[1].span_ms),
+    base_ns = hits[0].time_ns if hits else 0
+    groups = find_compact_groups(
+        [(hit.time_ns - base_ns) / 1e9 for hit in hits],
+        [hit.device for hit in hits],
+        window_ms=window_ms,
+        min_devices=min_devices,
     )
-    used_hits: set[Hit] = set()
-    coincidences: list[Coincidence] = []
-    for _, event in ranked_candidates:
-        if any(hit in used_hits for hit in event.hits):
-            continue
-        coincidences.append(event)
-        used_hits.update(event.hits)
-
-    coincidences.sort(key=lambda event: event.start_ns)
-    return coincidences
-
-
-def _build_reference_groups(
-    hits: list[Hit], reference_devices: tuple[str, ...], window_ms: float
-) -> list[tuple[Hit, ...]]:
-    """Costruisce coincidenze compatte usando soltanto i device indicati."""
-    window_ns = round(window_ms * 1e6)
-    hits_by_device = {
-        device: sorted(
-            (hit for hit in hits if hit.device == device),
-            key=lambda hit: hit.time_ns,
-        )
-        for device in reference_devices
-    }
-    times_by_device = {
-        device: [hit.time_ns for hit in device_hits]
-        for device, device_hits in hits_by_device.items()
-    }
-    anchor_device = min(reference_devices, key=lambda name: len(hits_by_device[name]))
-    other_devices = tuple(
-        device for device in reference_devices if device != anchor_device
-    )
-    candidates: dict[frozenset[Hit], tuple[float, int, tuple[Hit, ...]]] = {}
-
-    for anchor_hit in hits_by_device[anchor_device]:
-        nearby_by_device: list[list[Hit]] = []
-        for device in other_devices:
-            device_times = times_by_device[device]
-            begin = bisect.bisect_left(
-                device_times, anchor_hit.time_ns - window_ns
-            )
-            end = bisect.bisect_right(
-                device_times, anchor_hit.time_ns + window_ns
-            )
-            if begin == end:
-                break
-            nearby_by_device.append(hits_by_device[device][begin:end])
-        else:
-            for combination in product(*nearby_by_device):
-                group = (anchor_hit,) + combination
-                group_times = np.asarray(
-                    [hit.time_ns for hit in group], dtype=float
-                )
-                span_ns = int(np.max(group_times) - np.min(group_times))
-                if span_ns > window_ns:
-                    continue
-                median_ns = float(np.median(group_times))
-                dispersion = float(np.sum((group_times - median_ns) ** 2))
-                ordered_group = tuple(sorted(group, key=lambda hit: hit.time_ns))
-                candidates[frozenset(group)] = (
-                    dispersion, span_ns, ordered_group
-                )
-
-    # Tutti i candidati hanno la stessa molteplicità: si assegnano prima quelli
-    # con minore dispersione dalla mediana, poi quelli con span minore.
-    used_hits: set[Hit] = set()
-    selected_groups: list[tuple[Hit, ...]] = []
-    for _, _, group in sorted(candidates.values(), key=lambda item: item[:2]):
-        if any(hit in used_hits for hit in group):
-            continue
-        selected_groups.append(group)
-        used_hits.update(group)
-    selected_groups.sort(key=lambda group: np.median([hit.time_ns for hit in group]))
-    return selected_groups
-
-
-def _count_central_matches(
-    reference_groups: list[tuple[Hit, ...]],
-    central_hits: list[Hit],
-    window_ms: float,
-) -> int:
-    """Associa uno-a-uno ogni centrale al gruppo di riferimento più vicino."""
-    window_ns = round(window_ms * 1e6)
-    sorted_central = sorted(central_hits, key=lambda hit: hit.time_ns)
-    central_times = [hit.time_ns for hit in sorted_central]
-    candidates: list[tuple[float, int, int]] = []
-
-    for group_index, group in enumerate(reference_groups):
-        group_times = [hit.time_ns for hit in group]
-        earliest_central = max(group_times) - window_ns
-        latest_central = min(group_times) + window_ns
-        median_ns = float(np.median(group_times))
-        begin = bisect.bisect_left(central_times, earliest_central)
-        end = bisect.bisect_right(central_times, latest_central)
-        candidates.extend(
-            (abs(central_times[index] - median_ns), group_index, index)
-            for index in range(begin, end)
-        )
-
-    used_groups: set[int] = set()
-    used_central: set[int] = set()
-    for _, group_index, central_index in sorted(candidates):
-        if group_index in used_groups or central_index in used_central:
-            continue
-        used_groups.add(group_index)
-        used_central.add(central_index)
-    return len(used_groups)
+    return [Coincidence(tuple(hits[index] for index in group.indices)) for group in groups]
 
 
 def estimate_detector_efficiencies(
     hits: list[Hit],
     window_ms: float,
+    reference_min_sipm_mv: float = 0.0,
 ) -> list[EfficiencyEstimate]:
     """Stima l'efficienza sandwich correggendo le coincidenze accidentali.
 
     Per il device i-esimo il campione di riferimento contiene gli eventi nei
     quali sono presenti i suoi vicini immediati i-1 e i+1. Il riferimento
     seleziona quindi una particella compatibile con l'attraversamento del piano
-    centrale senza richiedere a priori che quest'ultimo abbia risposto.
+    centrale senza richiedere a priori che quest'ultimo abbia risposto. La
+    soglia software in ampiezza si applica soltanto ai due riferimenti: per il
+    centrale viene accettato qualunque hit registrato.
 
     Per processi di Poisson indipendenti, con il criterio |dt| <= window:
       B2 = 2 * r_lower * r_upper * window * T
@@ -431,29 +289,54 @@ def estimate_detector_efficiencies(
     if live_time_s <= 0:
         raise ValueError("tempo di acquisizione insufficiente per stimare i rate")
     window_s = window_ms / 1000.0
-    detector_counts = Counter(hit.device for hit in hits)
-    detector_rates = {
-        device: detector_counts[device] / live_time_s
+    all_detector_counts = Counter(hit.device for hit in hits)
+    reference_detector_counts = Counter(
+        hit.device for hit in hits
+        if hit.sipm_mv >= reference_min_sipm_mv
+    )
+    all_detector_rates = {
+        device: all_detector_counts[device] / live_time_s
         for device in DEVICE_NAMES
     }
+    reference_detector_rates = {
+        device: reference_detector_counts[device] / live_time_s
+        for device in DEVICE_NAMES
+    }
+    base_ns = hits[0].time_ns
+    timestamps_s = np.asarray(
+        [(hit.time_ns - base_ns) / 1e9 for hit in hits], dtype=float
+    )
+    detector_names = np.asarray([hit.device for hit in hits], dtype=str)
+    sipm_mv = np.asarray([hit.sipm_mv for hit in hits], dtype=float)
 
     for level in range(1, len(DEVICE_NAMES) - 1):
         lower = DEVICE_NAMES[level - 1]
         device = DEVICE_NAMES[level]
         upper = DEVICE_NAMES[level + 1]
-        reference_groups = _build_reference_groups(
-            hits, (lower, upper), window_ms
+        selected = (
+            (detector_names == device)
+            | (
+                (sipm_mv >= reference_min_sipm_mv)
+                & ((detector_names == lower) | (detector_names == upper))
+            )
+        )
+        selected_times = timestamps_s[selected]
+        selected_names = detector_names[selected]
+        reference_groups = build_reference_groups(
+            selected_times, selected_names, (lower, upper), window_ms
         )
         reference_events = len(reference_groups)
-        detected = _count_central_matches(
+        detected = len(match_probe_to_groups(
             reference_groups,
-            [hit for hit in hits if hit.device == device],
+            selected_times,
+            selected_names,
+            device,
             window_ms,
-        )
+        ))
         if reference_events:
-            lower_rate = detector_rates[lower]
-            central_rate = detector_rates[device]
-            upper_rate = detector_rates[upper]
+            lower_rate = reference_detector_rates[lower]
+            central_rate = all_detector_rates[device]
+            upper_rate = reference_detector_rates[upper]
             accidental_reference = (
                 2.0 * lower_rate * upper_rate * window_s * live_time_s
             )
@@ -478,13 +361,16 @@ def estimate_detector_efficiencies(
 def estimate_four_reference_efficiencies(
     hits: list[Hit],
     window_ms: float,
+    reference_min_sipm_mv: float = 0.0,
 ) -> list[FourReferenceEfficiencyEstimate]:
     """Stima l'efficienza usando due riferimenti sotto e due sopra.
 
     Sono misurabili soltanto TRE, QUATTRO, CINQUE, SEI e SETTE. Il denominatore
     richiede la coincidenza dei quattro piani di riferimento; il numeratore
-    richiede anche il centrale. Per n flussi di Poisson indipendenti e per il
-    criterio max(t)-min(t) <= window, il numero accidentale atteso e':
+    richiede anche un qualunque hit registrato nel centrale, senza applicargli
+    la soglia software usata per i riferimenti. Per n flussi di Poisson
+    indipendenti e per il criterio max(t)-min(t) <= window, il numero
+    accidentale atteso e':
 
         B_n = n * product(r_i) * window**(n-1) * T
 
@@ -499,11 +385,25 @@ def estimate_four_reference_efficiencies(
     if live_time_s <= 0:
         raise ValueError("tempo di acquisizione insufficiente per stimare i rate")
     window_s = window_ms / 1000.0
-    detector_counts = Counter(hit.device for hit in hits)
-    detector_rates = {
-        device: detector_counts[device] / live_time_s
+    all_detector_counts = Counter(hit.device for hit in hits)
+    reference_detector_counts = Counter(
+        hit.device for hit in hits
+        if hit.sipm_mv >= reference_min_sipm_mv
+    )
+    all_detector_rates = {
+        device: all_detector_counts[device] / live_time_s
         for device in DEVICE_NAMES
     }
+    reference_detector_rates = {
+        device: reference_detector_counts[device] / live_time_s
+        for device in DEVICE_NAMES
+    }
+    base_ns = hits[0].time_ns
+    timestamps_s = np.asarray(
+        [(hit.time_ns - base_ns) / 1e9 for hit in hits], dtype=float
+    )
+    detector_names = np.asarray([hit.device for hit in hits], dtype=str)
+    sipm_mv = np.asarray([hit.sipm_mv for hit in hits], dtype=float)
     estimates: list[FourReferenceEfficiencyEstimate] = []
 
     for level in range(2, len(DEVICE_NAMES) - 2):
@@ -511,27 +411,38 @@ def estimate_four_reference_efficiencies(
         lower_devices = (DEVICE_NAMES[level - 2], DEVICE_NAMES[level - 1])
         upper_devices = (DEVICE_NAMES[level + 1], DEVICE_NAMES[level + 2])
         reference_devices = lower_devices + upper_devices
-        reference_groups = _build_reference_groups(
-            hits, reference_devices, window_ms
+        is_reference = np.zeros(len(hits), dtype=bool)
+        for reference_device in reference_devices:
+            is_reference |= detector_names == reference_device
+        selected = (
+            (detector_names == device)
+            | ((sipm_mv >= reference_min_sipm_mv) & is_reference)
+        )
+        selected_times = timestamps_s[selected]
+        selected_names = detector_names[selected]
+        reference_groups = build_reference_groups(
+            selected_times, selected_names, reference_devices, window_ms
         )
         reference_events = len(reference_groups)
-        detected = _count_central_matches(
+        detected = len(match_probe_to_groups(
             reference_groups,
-            [hit for hit in hits if hit.device == device],
+            selected_times,
+            selected_names,
+            device,
             window_ms,
-        )
+        ))
 
         if not reference_events:
             continue
 
         reference_rate_product = float(np.prod([
-            detector_rates[name] for name in reference_devices
+            reference_detector_rates[name] for name in reference_devices
         ]))
         accidental_reference = (
             4.0 * reference_rate_product * window_s ** 3 * live_time_s
         )
         accidental_detected = (
-            5.0 * reference_rate_product * detector_rates[device]
+            5.0 * reference_rate_product * all_detector_rates[device]
             * window_s ** 4 * live_time_s
         )
         estimates.append(
@@ -550,22 +461,32 @@ def estimate_four_reference_efficiencies(
 
 def print_summary(
     path: Path,
-    hits: list[Hit],
+    all_hits: list[Hit],
+    display_hits: list[Hit],
     coincidences: list[Coincidence],
     efficiency_estimates: list[EfficiencyEstimate],
     four_reference_estimates: list[FourReferenceEfficiencyEstimate],
     window_ms: float,
     min_devices: int,
+    reference_min_sipm_mv: float,
     skipped: int,
 ) -> None:
-    detector_counts = Counter(hit.device for hit in hits)
+    detector_counts = Counter(hit.device for hit in display_hits)
     multiplicities = Counter(event.multiplicity for event in coincidences)
-    firmware_coincident = sum(hit.coincident_flag for hit in hits)
+    firmware_coincident = sum(hit.coincident_flag for hit in all_hits)
+    live_time_s = (
+        (all_hits[-1].time_ns - all_hits[0].time_ns) / 1e9
+        if len(all_hits) >= 2 else 0.0
+    )
 
     print(f"File: {path}")
-    print(f"Hit selezionati: {len(hits)} (righe non valide: {skipped})")
+    print(f"Hit validi nel file: {len(all_hits)} (righe non valide: {skipped})")
     print(
-        "Hit per device: "
+        f"Hit selezionati per l'event display (SiPM >= "
+        f"{reference_min_sipm_mv:g} mV): {len(display_hits)}"
+    )
+    print(
+        "Hit selezionati per device: "
         + ", ".join(f"{name}={detector_counts[name]}" for name in DEVICE_NAMES)
     )
     print(f"Flag Coincident=1 nel file: {firmware_coincident}")
@@ -581,10 +502,41 @@ def print_summary(
                 for multiplicity in sorted(multiplicities)
             )
         )
-    print("\nEfficienza di rivelazione corretta per le accidentali:")
-    print("  B2 = accidentali sotto+sopra; B3 = tripletti completamente accidentali")
+    print("\nCriteri comuni alle stime di efficienza:")
     print(
-        "  device    riferimento       N3     B3       N2      B2"
+        f"  - riferimenti: SiPM >= {reference_min_sipm_mv:g} mV; "
+        "centrale sotto test: qualunque hit registrato, senza soglia software"
+    )
+    print("  - resta naturalmente attiva la soglia hardware del rivelatore")
+    print(
+        f"  - un gruppo deve avere max(t)-min(t) <= {window_ms:g} ms; "
+        "gli hit sono associati uno-a-uno e non vengono riutilizzati"
+    )
+    print(
+        "  - fra più candidati si privilegia il gruppo temporalmente più "
+        "compatto; il centrale più vicino alla mediana dei riferimenti"
+    )
+    print(
+        f"  - W = {window_ms:g} ms e T = {live_time_s:.3f} s, durata fra "
+        "il primo e l'ultimo hit valido; ogni rate r_i e' N_i/T"
+    )
+    print(
+        "  - i termini Bn sono i conteggi completamente accidentali attesi "
+        "assumendo flussi di Poisson indipendenti"
+    )
+
+    print("\nSandwich a 3: un riferimento sotto + centrale + un riferimento sopra")
+    print("  N2 = coppie di riferimento; N3 = N2 con un hit del centrale")
+    print("  eff. grezza = N3/N2")
+    print("  B2 = 2*r_sotto*r_sopra*W*T")
+    print("  B3 = 3*r_sotto*r_centrale*r_sopra*W^2*T")
+    print("  eff. corretta = (N3-B3)/(N2-B2)")
+    print(
+        "  I rate dei riferimenti includono solo hit sopra soglia; "
+        "r_centrale include tutti gli hit registrati."
+    )
+    print(
+        "  device    riferimento    N3(any)    B3       N2      B2"
         "      eff. grezza       eff. corretta"
     )
     for estimate in efficiency_estimates:
@@ -609,10 +561,18 @@ def print_summary(
     if not efficiency_estimates:
         print("  nessuna coppia di riferimento disponibile")
 
-    print("\nEfficienza con due riferimenti sotto e due sopra:")
-    print("  B4 = quadruple accidentali; B5 = quintuple completamente accidentali")
+    print("\nSandwich a 5: due riferimenti sotto + centrale + due sopra")
+    print("  N4 = quadruple di riferimento; N5 = N4 con un hit del centrale")
+    print("  eff. grezza = N5/N4")
+    print("  B4 = 4*product(r_riferimenti)*W^3*T")
+    print("  B5 = 5*product(r_riferimenti)*r_centrale*W^4*T")
+    print("  eff. corretta = (N5-B5)/(N4-B4)")
     print(
-        "  device       riferimenti (sotto | sopra)          N5      B5"
+        "  Anche qui i quattro rate di riferimento sono calcolati sopra "
+        "soglia e il rate centrale senza soglia software."
+    )
+    print(
+        "  device       riferimenti (sotto | sopra)       N5(any)      B5"
         "      N4      B4      eff. grezza       eff. corretta"
     )
     for estimate in four_reference_estimates:
@@ -956,7 +916,10 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--min-sipm-mv", type=float, default=0.0,
-        help="scarta hit sotto questa ampiezza SiPM (default: 0)",
+        help=(
+            "soglia SiPM per event display e rivelatori di riferimento; "
+            "non si applica al centrale nella misura di efficienza (default: 0)"
+        ),
     )
     parser.add_argument(
         "--tower-height-cm", type=float, default=DEFAULT_TOWER_HEIGHT_CM,
@@ -977,29 +940,32 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> int:
     args = parse_arguments()
     try:
-        hits, skipped = load_hits(args.input, args.min_sipm_mv)
+        all_hits, skipped = load_hits(args.input)
+        display_hits = [
+            hit for hit in all_hits if hit.sipm_mv >= args.min_sipm_mv
+        ]
         # Le efficienze costruiscono gruppi dedicati usando soltanto i rispettivi
-        # riferimenti. --min-devices filtra esclusivamente l'event display.
-        all_coincidences = find_coincidences(hits, args.window_ms, min_devices=2)
+        # riferimenti. L'event display ottimizza direttamente alla molteplicità
+        # richiesta, evitando che gruppi più piccoli ne consumino gli hit.
+        coincidences = find_coincidences(
+            display_hits, args.window_ms, min_devices=args.min_devices
+        )
         efficiency_estimates = estimate_detector_efficiencies(
-            hits, args.window_ms
+            all_hits, args.window_ms, args.min_sipm_mv
         )
         four_reference_estimates = estimate_four_reference_efficiencies(
-            hits, args.window_ms
+            all_hits, args.window_ms, args.min_sipm_mv
         )
-        coincidences = [
-            event
-            for event in all_coincidences
-            if event.multiplicity >= args.min_devices
-        ]
         print_summary(
             args.input,
-            hits,
+            all_hits,
+            display_hits,
             coincidences,
             efficiency_estimates,
             four_reference_estimates,
             args.window_ms,
             args.min_devices,
+            args.min_sipm_mv,
             skipped,
         )
         show_events(
