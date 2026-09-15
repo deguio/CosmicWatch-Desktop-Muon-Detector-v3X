@@ -8,7 +8,9 @@ il grafico non attribuisce una singola pendenza alla traccia: mostra invece le
 rette campionate che intersecano tutti e soli i rivelatori accesi. Per i sette
 piani interni viene inoltre stimata l'efficienza con il
 rapporto N(sotto + centro + sopra) / N(sotto + sopra), usando i vicini
-immediati come telescopio di riferimento.
+immediati come telescopio di riferimento e sottraendo il fondo accidentale
+atteso dai rate di singola. Una seconda stima usa due piani sotto e due sopra
+per ridurre drasticamente la contaminazione accidentale.
 
 Esempi
 -------
@@ -83,15 +85,86 @@ class EfficiencyEstimate:
     upper_device: str
     detected: int
     reference_events: int
+    accidental_detected: float
+    accidental_reference: float
+
+    @property
+    def raw_efficiency(self) -> float:
+        return self.detected / self.reference_events
+
+    @property
+    def corrected_detected(self) -> float:
+        return self.detected - self.accidental_detected
+
+    @property
+    def corrected_reference(self) -> float:
+        return self.reference_events - self.accidental_reference
 
     @property
     def efficiency(self) -> float:
+        if self.corrected_reference <= 0:
+            return float("nan")
+        return self.corrected_detected / self.corrected_reference
+
+    @property
+    def standard_error(self) -> float:
+        """Errore approssimato: binomiale piu' fluttuazioni dei fondi Poisson."""
+        probability = self.efficiency
+        if not 0.0 <= probability <= 1.0:
+            return float("nan")
+        binomial_variance = (
+            probability * (1.0 - probability) / self.corrected_reference
+        )
+        background_variance = (
+            self.accidental_detected
+            + probability ** 2 * self.accidental_reference
+        ) / self.corrected_reference ** 2
+        return (binomial_variance + background_variance) ** 0.5
+
+
+@dataclass(frozen=True)
+class FourReferenceEfficiencyEstimate:
+    """Efficienza di un centrale selezionato da due piani sopra e due sotto."""
+
+    device: str
+    lower_devices: tuple[str, str]
+    upper_devices: tuple[str, str]
+    detected: int
+    reference_events: int
+    accidental_detected: float
+    accidental_reference: float
+
+    @property
+    def raw_efficiency(self) -> float:
         return self.detected / self.reference_events
+
+    @property
+    def corrected_detected(self) -> float:
+        return self.detected - self.accidental_detected
+
+    @property
+    def corrected_reference(self) -> float:
+        return self.reference_events - self.accidental_reference
+
+    @property
+    def efficiency(self) -> float:
+        if self.corrected_reference <= 0:
+            return float("nan")
+        return self.corrected_detected / self.corrected_reference
 
     @property
     def standard_error(self) -> float:
         probability = self.efficiency
-        return (probability * (1.0 - probability) / self.reference_events) ** 0.5
+        if not 0.0 <= probability <= 1.0:
+            return float("nan")
+        binomial_variance = (
+            probability * (1.0 - probability) / self.corrected_reference
+        )
+        background_variance = (
+            self.accidental_detected
+            + probability ** 2 * self.accidental_reference
+        ) / self.corrected_reference ** 2
+        return (binomial_variance + background_variance) ** 0.5
 
 
 def _computer_timestamp_ns(time_text: str, date_text: str) -> int:
@@ -204,16 +277,37 @@ def find_coincidences(
 
 def estimate_detector_efficiencies(
     coincidences: list[Coincidence],
+    hits: list[Hit],
+    window_ms: float,
 ) -> list[EfficiencyEstimate]:
-    """Stima l'efficienza dei sette scintillatori interni con il sandwich.
+    """Stima l'efficienza sandwich correggendo le coincidenze accidentali.
 
     Per il device i-esimo il campione di riferimento contiene gli eventi nei
     quali sono presenti i suoi vicini immediati i-1 e i+1. Il riferimento
     seleziona quindi una particella compatibile con l'attraversamento del piano
     centrale senza richiedere a priori che quest'ultimo abbia risposto.
+
+    Per processi di Poisson indipendenti, con il criterio |dt| <= window:
+      B2 = 2 * r_lower * r_upper * window * T
+      B3 = 3 * r_lower * r_central * r_upper * window**2 * T
+    B2 viene sottratto alle coppie di riferimento e B3 ai tripletti osservati.
     """
+    if window_ms <= 0:
+        raise ValueError("la finestra di efficienza deve essere positiva")
+    if len(hits) < 2:
+        return []
+
     estimates: list[EfficiencyEstimate] = []
     device_sets = [{hit.device for hit in event.hits} for event in coincidences]
+    live_time_s = (hits[-1].time_ns - hits[0].time_ns) / 1e9
+    if live_time_s <= 0:
+        raise ValueError("tempo di acquisizione insufficiente per stimare i rate")
+    window_s = window_ms / 1000.0
+    detector_counts = Counter(hit.device for hit in hits)
+    detector_rates = {
+        device: detector_counts[device] / live_time_s
+        for device in DEVICE_NAMES
+    }
 
     for level in range(1, len(DEVICE_NAMES) - 1):
         lower = DEVICE_NAMES[level - 1]
@@ -226,6 +320,16 @@ def estimate_detector_efficiencies(
                 reference_events += 1
                 detected += device in active_devices
         if reference_events:
+            lower_rate = detector_rates[lower]
+            central_rate = detector_rates[device]
+            upper_rate = detector_rates[upper]
+            accidental_reference = (
+                2.0 * lower_rate * upper_rate * window_s * live_time_s
+            )
+            accidental_detected = (
+                3.0 * lower_rate * central_rate * upper_rate
+                * window_s ** 2 * live_time_s
+            )
             estimates.append(
                 EfficiencyEstimate(
                     device=device,
@@ -233,8 +337,84 @@ def estimate_detector_efficiencies(
                     upper_device=upper,
                     detected=detected,
                     reference_events=reference_events,
+                    accidental_detected=accidental_detected,
+                    accidental_reference=accidental_reference,
                 )
             )
+    return estimates
+
+
+def estimate_four_reference_efficiencies(
+    coincidences: list[Coincidence],
+    hits: list[Hit],
+    window_ms: float,
+) -> list[FourReferenceEfficiencyEstimate]:
+    """Stima l'efficienza usando due riferimenti sotto e due sopra.
+
+    Sono misurabili soltanto TRE, QUATTRO, CINQUE, SEI e SETTE. Il denominatore
+    richiede la coincidenza dei quattro piani di riferimento; il numeratore
+    richiede anche il centrale. Per n flussi di Poisson indipendenti e per il
+    criterio max(t)-min(t) <= window, il numero accidentale atteso e':
+
+        B_n = n * product(r_i) * window**(n-1) * T
+
+    Vengono quindi sottratti B4 dal denominatore e B5 dal numeratore.
+    """
+    if window_ms <= 0:
+        raise ValueError("la finestra di efficienza deve essere positiva")
+    if len(hits) < 2:
+        return []
+
+    live_time_s = (hits[-1].time_ns - hits[0].time_ns) / 1e9
+    if live_time_s <= 0:
+        raise ValueError("tempo di acquisizione insufficiente per stimare i rate")
+    window_s = window_ms / 1000.0
+    detector_counts = Counter(hit.device for hit in hits)
+    detector_rates = {
+        device: detector_counts[device] / live_time_s
+        for device in DEVICE_NAMES
+    }
+    device_sets = [{hit.device for hit in event.hits} for event in coincidences]
+    estimates: list[FourReferenceEfficiencyEstimate] = []
+
+    for level in range(2, len(DEVICE_NAMES) - 2):
+        device = DEVICE_NAMES[level]
+        lower_devices = (DEVICE_NAMES[level - 2], DEVICE_NAMES[level - 1])
+        upper_devices = (DEVICE_NAMES[level + 1], DEVICE_NAMES[level + 2])
+        reference_devices = lower_devices + upper_devices
+        reference_set = set(reference_devices)
+        reference_events = 0
+        detected = 0
+
+        for active_devices in device_sets:
+            if reference_set.issubset(active_devices):
+                reference_events += 1
+                detected += device in active_devices
+
+        if not reference_events:
+            continue
+
+        reference_rate_product = float(np.prod([
+            detector_rates[name] for name in reference_devices
+        ]))
+        accidental_reference = (
+            4.0 * reference_rate_product * window_s ** 3 * live_time_s
+        )
+        accidental_detected = (
+            5.0 * reference_rate_product * detector_rates[device]
+            * window_s ** 4 * live_time_s
+        )
+        estimates.append(
+            FourReferenceEfficiencyEstimate(
+                device=device,
+                lower_devices=lower_devices,
+                upper_devices=upper_devices,
+                detected=detected,
+                reference_events=reference_events,
+                accidental_detected=accidental_detected,
+                accidental_reference=accidental_reference,
+            )
+        )
     return estimates
 
 
@@ -243,6 +423,7 @@ def print_summary(
     hits: list[Hit],
     coincidences: list[Coincidence],
     efficiency_estimates: list[EfficiencyEstimate],
+    four_reference_estimates: list[FourReferenceEfficiencyEstimate],
     window_ms: float,
     min_devices: int,
     skipped: int,
@@ -270,18 +451,63 @@ def print_summary(
                 for multiplicity in sorted(multiplicities)
             )
         )
-    print("\nEfficienza di rivelazione (metodo dei vicini immediati):")
-    print("  device     riferimento      rilevati/totali       efficienza")
+    print("\nEfficienza di rivelazione corretta per le accidentali:")
+    print("  B2 = accidentali sotto+sopra; B3 = tripletti completamente accidentali")
+    print(
+        "  device    riferimento       N3     B3       N2      B2"
+        "      eff. grezza       eff. corretta"
+    )
     for estimate in efficiency_estimates:
+        corrected_efficiency = estimate.efficiency
+        corrected_error = estimate.standard_error
+        if np.isfinite(corrected_error):
+            corrected_text = (
+                f"{100.0 * corrected_efficiency:7.2f} +/- "
+                f"{100.0 * corrected_error:5.2f} %"
+            )
+        else:
+            corrected_text = (
+                f"{100.0 * corrected_efficiency:7.2f} % [stima instabile]"
+            )
         print(
-            f"  {estimate.device:<9} "
+            f"  {estimate.device:<8} "
             f"{estimate.lower_device:>7}+{estimate.upper_device:<7} "
-            f"{estimate.detected:>7}/{estimate.reference_events:<7} "
-            f"{100.0 * estimate.efficiency:8.2f} +/- "
-            f"{100.0 * estimate.standard_error:.2f} %"
+            f"{estimate.detected:>5} {estimate.accidental_detected:>6.1f} "
+            f"{estimate.reference_events:>7} {estimate.accidental_reference:>7.1f} "
+            f"{100.0 * estimate.raw_efficiency:9.2f} %    {corrected_text}"
         )
     if not efficiency_estimates:
         print("  nessuna coppia di riferimento disponibile")
+
+    print("\nEfficienza con due riferimenti sotto e due sopra:")
+    print("  B4 = quadruple accidentali; B5 = quintuple completamente accidentali")
+    print(
+        "  device       riferimenti (sotto | sopra)          N5      B5"
+        "      N4      B4      eff. grezza       eff. corretta"
+    )
+    for estimate in four_reference_estimates:
+        corrected_error = estimate.standard_error
+        if np.isfinite(corrected_error):
+            corrected_text = (
+                f"{100.0 * estimate.efficiency:7.2f} +/- "
+                f"{100.0 * corrected_error:5.2f} %"
+            )
+        else:
+            corrected_text = (
+                f"{100.0 * estimate.efficiency:7.2f} % [stima instabile]"
+            )
+        reference_text = (
+            f"{estimate.lower_devices[0]}+{estimate.lower_devices[1]} | "
+            f"{estimate.upper_devices[0]}+{estimate.upper_devices[1]}"
+        )
+        print(
+            f"  {estimate.device:<8} {reference_text:<34} "
+            f"{estimate.detected:>4} {estimate.accidental_detected:>7.4f} "
+            f"{estimate.reference_events:>7} {estimate.accidental_reference:>7.3f} "
+            f"{100.0 * estimate.raw_efficiency:9.2f} %    {corrected_text}"
+        )
+    if not four_reference_estimates:
+        print("  nessuna coincidenza quadrupla di riferimento disponibile")
 
 
 def _draw_possible_trajectories(
@@ -625,7 +851,12 @@ def main() -> int:
         # L'efficienza usa il campione minimo a due piani. --min-devices filtra
         # soltanto gli eventi presentati nel display e non cambia la stima.
         all_coincidences = find_coincidences(hits, args.window_ms, min_devices=2)
-        efficiency_estimates = estimate_detector_efficiencies(all_coincidences)
+        efficiency_estimates = estimate_detector_efficiencies(
+            all_coincidences, hits, args.window_ms
+        )
+        four_reference_estimates = estimate_four_reference_efficiencies(
+            all_coincidences, hits, args.window_ms
+        )
         coincidences = [
             event
             for event in all_coincidences
@@ -636,6 +867,7 @@ def main() -> int:
             hits,
             coincidences,
             efficiency_estimates,
+            four_reference_estimates,
             args.window_ms,
             args.min_devices,
             skipped,
