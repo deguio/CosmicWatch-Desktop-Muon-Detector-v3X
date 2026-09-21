@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import glob
 import json
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.signal import savgol_filter
 from scipy.special import log_ndtr
+from scipy.stats import norm, t as student_t
 
 
 PARAMETERS = ['baseline_mV', 'scale_mV', 't0_ns', 'tau_rise_ns', 'tau_decay_ns']
@@ -194,9 +196,9 @@ def clean_json(value):
     return value
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('input', type=Path, help='RTO metadata .csv or companion .Wfm.csv')
+    parser.add_argument('inputs', nargs='+', help='One or more CSV files, directories, or quoted glob patterns')
     parser.add_argument('--fraction', type=float, default=.2)
     parser.add_argument('--smooth-samples', type=int, default=5, help='Odd Savitzky-Golay window; 1 disables smoothing')
     parser.add_argument('--baseline-end-ns', type=float, help='End of pre-pulse baseline; default first 15%% of record')
@@ -205,6 +207,8 @@ def main():
     parser.add_argument('--show', action='store_true', help='Also open matplotlib plots')
     parser.add_argument('--distance-m', type=float, help='Muon path length between detectors, not just vertical separation')
     parser.add_argument('--offset-ns', type=float, help='Calibrated instrumental t(C2)-t(C1) offset to subtract')
+    parser.add_argument('--summary-method', choices=['constant_fraction', 'causal', 'gaussian'],
+                        default='constant_fraction', help='Timing estimator used for the batch velocity histogram')
     args = parser.parse_args()
     if not 0 < args.fraction < 1:
         parser.error('--fraction must be between 0 and 1.')
@@ -212,15 +216,19 @@ def main():
         parser.error('--smooth-samples must be 1 or an odd integer >= 3.')
     if args.distance_m is not None and (args.distance_m <= 0 or args.offset_ns is None):
         parser.error('A positive --distance-m requires an explicit calibrated --offset-ns (0 if calibrated zero).')
+    return args, parser
+
+
+def analyze_event(args):
     t, y, labels, metadata = load_rto(args.input)
     if args.smooth_samples >= len(t):
-        parser.error('Smoothing window exceeds record length.')
+        raise ValueError('Smoothing window exceeds record length.')
     baseline_end = args.baseline_end_ns if args.baseline_end_ns is not None else t[0]+.15*np.ptp(t)
     mask = np.ones(len(t), dtype=bool)
     if args.fit_range_ns:
         mask = (t >= args.fit_range_ns[0]) & (t <= args.fit_range_ns[1])
         if mask.sum() < 30:
-            parser.error('Fit interval needs at least 30 samples.')
+            raise ValueError('Fit interval needs at least 30 samples.')
     prepared = [prepare(t, y[:, j], baseline_end, args.smooth_samples) for j in range(2)]
     fit_prepared = prepared if mask.all() else [
         prepare(t[mask], y[mask, j], baseline_end, args.smooth_samples) for j in range(2)]
@@ -269,7 +277,7 @@ def main():
         writer.writeheader()
         writer.writerows(scan)
     import matplotlib
-    if not args.show:
+    if getattr(args, 'headless', not args.show):
         matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     plt.rcParams.update({'font.size': 9, 'axes.titlesize': 10,
@@ -398,6 +406,197 @@ def main():
         plt.show()
     plt.close(fig)
     plt.close(scope)
+    return report
+
+
+def expand_inputs(inputs):
+    """Resolve headers and companions exactly once; directories are nonrecursive."""
+    headers = set()
+    for expression in inputs:
+        candidate = Path(expression).expanduser()
+        matches = sorted(candidate.glob('*.csv')) if candidate.is_dir() else [
+            Path(value) for value in sorted(glob.glob(str(candidate)))]
+        if not matches:
+            raise ValueError(f'No input matches: {expression}')
+        added = False
+        for path in matches:
+            if path.name.endswith('.Wfm.csv'):
+                path = path.with_name(path.name[:-8] + '.csv')
+            if not path.is_file():
+                raise ValueError(f'Missing metadata file: {path}')
+            # Skip unrelated CSV files when scanning a directory or wildcard.
+            content = path.read_text(encoding='utf-8-sig')
+            if 'SignalRecordLength:' not in content or 'Resolution:' not in content:
+                if len(matches) == 1 and not candidate.is_dir() and not glob.has_magic(str(candidate)):
+                    raise ValueError(f'Not an RTO metadata file: {path}')
+                continue
+            headers.add(path.resolve())
+            added = True
+        if not added:
+            raise ValueError(f'No RTO exports found in: {expression}')
+    paths = sorted(headers)
+    if len({path.stem for path in paths}) != len(paths):
+        raise ValueError('Different input directories contain identical export names; use distinct names to avoid overwriting outputs.')
+    return paths
+
+
+def gaussian_statistics(values):
+    """Unbinned normal MLE; SEM and Student interval assume independent normal data."""
+    values = np.asarray(values, dtype=float)
+    if len(values) == 0 or not np.isfinite(values).all():
+        raise ValueError('Gaussian summary requires finite, nonempty data.')
+    mu, sigma = norm.fit(values)
+    result = {'n': len(values), 'mean': float(mu), 'sigma_mle': float(sigma),
+              'sem': None, 'mean_ci95': None,
+              'fit_status': 'ok' if len(values) >= 2 and sigma > 0 else 'insufficient_spread_or_count'}
+    if len(values) >= 2 and sigma > 0:
+        sem = float(np.std(values, ddof=1) / np.sqrt(len(values)))
+        width = float(student_t.ppf(.975, len(values)-1) * sem)
+        result.update(sem=sem, mean_ci95=[float(mu-width), float(mu+width)])
+    return result
+
+
+def build_summary(reports, failures, args, output):
+    method = args.summary_method
+    rows, exclusions = [], []
+    for report in reports:
+        event = Path(report['input']['header']).stem
+        timing = report['timing'][method]
+        flags = [f'{label}: {flag}' for label, channel in report['channels'].items()
+                 for flag in channel['fits']['causal' if method == 'constant_fraction' else method]['flags']]
+        row = {'event': event, 'method': method, 'delta_ns': timing['delta_ns'],
+               'corrected_delta_ns': timing['corrected_delta_ns'],
+               'speed_m_per_s': timing.get('speed_m_per_s'), 'beta': timing.get('beta'),
+               'distance_m': args.distance_m, 'offset_ns': args.offset_ns,
+               'fraction': args.fraction, 'flags': ' | '.join(flags)}
+        rows.append(row)
+        if row['beta'] is None or not np.isfinite(row['beta']):
+            exclusions.append({'event': event, 'reason': 'Zero corrected time or nonfinite velocity'})
+    usable = [row for row in rows if row['beta'] is not None and np.isfinite(row['beta'])]
+    statistics = gaussian_statistics([row['beta'] for row in usable]) if usable else None
+    tof_statistics = gaussian_statistics([row['corrected_delta_ns'] for row in usable]) if usable else None
+    messages = ['Gaussian MLE uses individual events, not histogram bins. SEM/CI assume independent normal events.',
+                'Common distance, cable and detector calibration uncertainties are not included.',
+                'No cut on v/c > 1 or pulse-fit quality; inspect individual fits and flagged events.']
+    if len(usable) < 10:
+        messages.append('Very small sample: Gaussian shape and precision cannot be established; preliminary result.')
+    tof_velocity = None
+    if usable:
+        times = np.array([row['corrected_delta_ns'] for row in usable])
+        if np.all(times > 0) or np.all(times < 0):
+            mean_t = tof_statistics['mean']
+            speed = args.distance_m / abs(mean_t) * 1e9
+            interval = tof_statistics['mean_ci95']
+            beta_ci = None
+            if interval is not None and interval[0] * interval[1] > 0:
+                beta_ci = sorted(args.distance_m / abs(bound) * 1e9 / 299792458. for bound in interval)
+            tof_velocity = {'speed_m_per_s': speed, 'beta': speed/299792458., 'beta_ci95': beta_ci,
+                            'assumption': 'Common flight path and direction; Gaussian timing errors.'}
+        else:
+            messages.append('Mixed signs of corrected times: no common-direction speed from mean time reported.')
+    summary = {'method': method, 'distance_m': args.distance_m, 'offset_ns': args.offset_ns,
+               'fraction': args.fraction, 'successful_events': len(reports), 'velocity_events': len(usable),
+               'failed_events': failures, 'excluded_from_velocity': exclusions,
+               'gaussian_velocity_beta': statistics, 'gaussian_corrected_time_ns': tof_statistics,
+               'speed_from_mean_time': tof_velocity, 'events': rows, 'notes': messages}
+    if statistics is not None:
+        summary['gaussian_velocity_m_per_s'] = {
+            'mean': statistics['mean']*299792458., 'sigma_mle': statistics['sigma_mle']*299792458.,
+            'sem': statistics['sem']*299792458. if statistics['sem'] is not None else None}
+    prefix = output / f'summary_{method}'
+    prefix.with_suffix('.json').write_text(json.dumps(clean_json(summary), indent=2)+'\n')
+    with prefix.with_suffix('.csv').open('w', newline='') as stream:
+        columns = ['event', 'method', 'delta_ns', 'corrected_delta_ns', 'speed_m_per_s', 'beta',
+                   'distance_m', 'offset_ns', 'fraction', 'flags']
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+    import matplotlib
+    if not args.show:
+        matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.3), dpi=110, layout='constrained')
+    for ax, values, stats, label, reference in [
+        (axes[0], [row['beta'] for row in usable], statistics, 'Muon speed v / c', 1.),
+        (axes[1], [row['corrected_delta_ns'] for row in usable], tof_statistics,
+         'Corrected Δt [ns]', args.distance_m / 299792458. * 1e9),
+    ]:
+        ax.set(xlabel=label, ylabel='Probability density')
+        ax.grid(alpha=.15)
+        if not values:
+            ax.text(.5, .5, 'No usable velocities', ha='center', transform=ax.transAxes)
+            continue
+        values = np.asarray(values)
+        mean, sigma = stats['mean'], stats['sigma_mle']
+        width = max(float(np.ptp(values)), abs(mean)*.02, .01)
+        # Equal-width bins are only a display choice; the fit is unbinned.
+        ax.hist(values, bins=np.linspace(values.min()-width*.12, values.max()+width*.12,
+                                        max(3, min(25, int(np.ceil(np.sqrt(len(values))))))+1),
+                density=True, color='#6aaed6', edgecolor='white', alpha=.65, label=f'Events (N={len(values)})')
+        ax.plot(values, np.zeros_like(values), '|', ms=12, color='#184b70', clip_on=False)
+        if stats['fit_status'] == 'ok':
+            x = np.linspace(min(values.min()-.2*width, mean-3*sigma),
+                            max(values.max()+.2*width, mean+3*sigma), 400)
+            ax.plot(x, norm.pdf(x, mean, sigma), color='#c8443c', lw=1.5, label='Gaussian MLE (unbinned)')
+        ax.axvline(reference, color='0.35', ls=':', label='c reference')
+        lines = [f'μ = {mean:.4f}', f'σ (MLE) = {sigma:.4f}']
+        if stats['sem'] is not None:
+            lines[0] += f' ± {stats["sem"]:.4f} (SEM)'
+            lines.append(f'95% CI μ: [{stats["mean_ci95"][0]:.4f}, {stats["mean_ci95"][1]:.4f}]')
+        else:
+            lines.append('Gaussian width / mean uncertainty not estimable')
+        if ax is axes[0]:
+            lines.append(f'Mean v = {mean*299792458./1e8:.3f} × 10⁸ m/s')
+        elif tof_velocity is not None:
+            lines.append(f'L / |mean Δt| = {tof_velocity["beta"]:.4f} c')
+        ax.set_title('\n'.join(lines), fontsize=9, pad=10)
+        ax.legend(loc='upper center', bbox_to_anchor=(.5, -.16), fontsize=7, ncol=2, frameon=False)
+    label = f'CFD {args.fraction:.0%}' if method == 'constant_fraction' else f'{method} t0'
+    fig.suptitle(f'Muon velocity summary · {label} · L = {args.distance_m:g} m · shift = {args.offset_ns:g} ns\n'
+                 f'{len(usable)} velocities · {len(failures)} failed exports · {len(exclusions)} undefined velocities'
+                 + (' · PRELIMINARY: very small sample' if len(usable) < 10 else ''), fontsize=10)
+    fig.supxlabel('Statistical errors only; distance/offset systematics excluded. Gaussian speed and Gaussian time are different models.', fontsize=8)
+    fig.savefig(prefix.with_suffix('.png'), dpi=110)
+    fig.savefig(prefix.with_suffix('.pdf'))
+    if args.show:
+        plt.show()
+    plt.close(fig)
+    if statistics is not None:
+        print(f'Summary ({method}): N={statistics["n"]}, mean v/c={statistics["mean"]:.5f}, SEM={statistics["sem"]}')
+    print(f'Summary files: {prefix}')
+    return summary
+
+
+def main():
+    args, parser = parse_args()
+    try:
+        paths = expand_inputs(args.inputs)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
+    batch = len(paths) > 1
+    if batch and (args.distance_m is None or args.offset_ns is None):
+        parser.error('Multiple exports require --distance-m and --offset-ns to create the velocity summary.')
+    output = args.output_dir or paths[0].parent / 'timing_results'
+    output.mkdir(parents=True, exist_ok=True)
+    reports, failures = [], []
+    for index, path in enumerate(paths, 1):
+        print(f'\n[{index}/{len(paths)}] {path.name}')
+        event_args = argparse.Namespace(**vars(args))
+        event_args.input = path
+        event_args.output_dir = output
+        event_args.headless = not args.show
+        event_args.show = args.show and not batch
+        try:
+            reports.append(analyze_event(event_args))
+        except (ValueError, OSError, RuntimeError) as error:
+            if not batch:
+                raise
+            failures.append({'input': str(path), 'error': str(error)})
+            print(f'FAILED: {path.name}: {error}')
+    if batch:
+        build_summary(reports, failures, args, output)
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
