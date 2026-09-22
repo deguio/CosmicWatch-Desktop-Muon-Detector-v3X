@@ -17,6 +17,34 @@ from scipy.stats import norm, t as student_t
 PARAMETERS = ['baseline_mV', 'scale_mV', 't0_ns', 'tau_rise_ns', 'tau_decay_ns']
 
 
+class AmplitudeRejected(Exception):
+    def __init__(self, selection):
+        self.selection = selection
+        super().__init__(selection['reason'])
+
+
+def amplitude_selection(t, y, labels, baseline_end, threshold=None, maximum=None):
+    """Cut on raw peak magnitude above each channel's own pre-pulse baseline."""
+    mask = t <= baseline_end
+    if mask.sum() < 20:
+        raise ValueError('Select at least 20 pre-pulse samples for the baseline.')
+    amplitudes = np.max(np.abs(y - np.mean(y[mask], axis=0)), axis=0)
+    below = [label for label, amplitude in zip(labels, amplitudes)
+             if threshold is not None and amplitude < threshold]
+    above = [label for label, amplitude in zip(labels, amplitudes)
+             if maximum is not None and amplitude > maximum]
+    reasons = []
+    if below:
+        reasons.append(f'Below {threshold:g} mV: {", ".join(below)}')
+    if above:
+        reasons.append(f'Above {maximum:g} mV: {", ".join(above)}')
+    return {'accepted': not reasons, 'min_amplitude_mV': threshold,
+            'max_amplitude_mV': maximum,
+            'definition': 'Maximum absolute baseline-subtracted raw sample, before smoothing or fitting',
+            'peak_amplitudes_mV': dict(zip(labels, map(float, amplitudes))),
+            'reason': '; '.join(reasons) if reasons else 'Both channels pass'}
+
+
 def load_rto(path):
     """Read the metadata CSV and companion .Wfm.csv, without inventing a time axis."""
     path = Path(path)
@@ -200,6 +228,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('inputs', nargs='+', help='One or more CSV files, directories, or quoted glob patterns')
     parser.add_argument('--fraction', type=float, default=.2)
+    parser.add_argument('--min-amplitude-mv', type=float,
+                        help='Require BOTH raw peak magnitudes above their baselines to be >= this value in mV; default: no amplitude cut')
+    parser.add_argument('--max-amplitude-mv', type=float,
+                        help='Require BOTH raw peak magnitudes above their baselines to be <= this value in mV; default: no upper cut')
     parser.add_argument('--smooth-samples', type=int, default=5, help='Odd Savitzky-Golay window; 1 disables smoothing')
     parser.add_argument('--baseline-end-ns', type=float, help='End of pre-pulse baseline; default first 15%% of record')
     parser.add_argument('--fit-range-ns', type=float, nargs=2, metavar=('START', 'STOP'))
@@ -210,6 +242,13 @@ def parse_args():
     parser.add_argument('--summary-method', choices=['constant_fraction', 'causal', 'gaussian'],
                         default='constant_fraction', help='Timing estimator used for the batch velocity histogram')
     args = parser.parse_args()
+    if args.min_amplitude_mv is not None and (not np.isfinite(args.min_amplitude_mv) or args.min_amplitude_mv < 0):
+        parser.error('--min-amplitude-mv must be finite and nonnegative.')
+    if args.max_amplitude_mv is not None and (not np.isfinite(args.max_amplitude_mv) or args.max_amplitude_mv < 0):
+        parser.error('--max-amplitude-mv must be finite and nonnegative.')
+    if (args.min_amplitude_mv is not None and args.max_amplitude_mv is not None
+            and args.min_amplitude_mv > args.max_amplitude_mv):
+        parser.error('--min-amplitude-mv must not exceed --max-amplitude-mv.')
     if not 0 < args.fraction < 1:
         parser.error('--fraction must be between 0 and 1.')
     if args.smooth_samples != 1 and (args.smooth_samples < 3 or args.smooth_samples % 2 == 0):
@@ -224,6 +263,12 @@ def analyze_event(args):
     if args.smooth_samples >= len(t):
         raise ValueError('Smoothing window exceeds record length.')
     baseline_end = args.baseline_end_ns if args.baseline_end_ns is not None else t[0]+.15*np.ptp(t)
+    selection = None
+    if args.min_amplitude_mv is not None or args.max_amplitude_mv is not None:
+        selection = amplitude_selection(t, y, labels, baseline_end,
+                                        args.min_amplitude_mv, args.max_amplitude_mv)
+        if not selection['accepted']:
+            raise AmplitudeRejected(selection)
     mask = np.ones(len(t), dtype=bool)
     if args.fit_range_ns:
         mask = (t >= args.fit_range_ns[0]) & (t <= args.fit_range_ns[1])
@@ -255,7 +300,8 @@ def analyze_event(args):
     for window in (1, 3, 5, 7, 9):
         pair = [constant_fraction(t, prepare(t, y[:, j], baseline_end, window), args.fraction) for j in range(2)]
         smoothing_scan.append({'samples': window, 'delta_ns': pair[1]['time_ns']-pair[0]['time_ns']})
-    report = {'input': metadata, 'convention': f'deltaT = t({labels[1]}) - t({labels[0]})',
+    report = {'input': metadata, 'amplitude_selection': selection,
+              'convention': f'deltaT = t({labels[1]}) - t({labels[0]})',
               'baseline_end_ns': baseline_end, 'smooth_samples': args.smooth_samples,
               'fraction': args.fraction, 'fit_range_ns': args.fit_range_ns,
               'offset_ns': args.offset_ns, 'distance_m': args.distance_m,
@@ -456,7 +502,8 @@ def gaussian_statistics(values):
     return result
 
 
-def build_summary(reports, failures, args, output):
+def build_summary(reports, failures, args, output, rejected=None):
+    rejected = rejected or []
     method = args.summary_method
     rows, exclusions = [], []
     for report in reports:
@@ -495,6 +542,9 @@ def build_summary(reports, failures, args, output):
         else:
             messages.append('Mixed signs of corrected times: no common-direction speed from mean time reported.')
     summary = {'method': method, 'distance_m': args.distance_m, 'offset_ns': args.offset_ns,
+               'min_amplitude_mV': getattr(args, 'min_amplitude_mv', None),
+               'max_amplitude_mV': getattr(args, 'max_amplitude_mv', None),
+               'amplitude_rejected_events': rejected,
                'fraction': args.fraction, 'successful_events': len(reports), 'velocity_events': len(usable),
                'failed_events': failures, 'excluded_from_velocity': exclusions,
                'gaussian_velocity_beta': statistics, 'gaussian_corrected_time_ns': tof_statistics,
@@ -511,6 +561,17 @@ def build_summary(reports, failures, args, output):
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
+    # Separate selection log includes both accepted and rejected exports.
+    selection_rows = [{'event': Path(report['input']['header']).stem,
+                       **(report.get('amplitude_selection') or {'accepted': True, 'reason': 'No amplitude cut'})}
+                      for report in reports]
+    selection_rows += rejected
+    with (output / f'summary_{method}_selection.csv').open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=['event', 'accepted', 'min_amplitude_mV', 'max_amplitude_mV',
+                                                   'peak_amplitudes_mV', 'reason'], extrasaction='ignore')
+        writer.writeheader()
+        for row in selection_rows:
+            writer.writerow({**row, 'peak_amplitudes_mV': json.dumps(row.get('peak_amplitudes_mV', {}))})
     import matplotlib
     if not args.show:
         matplotlib.use('Agg')
@@ -529,10 +590,13 @@ def build_summary(reports, failures, args, output):
         values = np.asarray(values)
         mean, sigma = stats['mean'], stats['sigma_mle']
         width = max(float(np.ptp(values)), abs(mean)*.02, .01)
+        # Recompute after all selections; no fixed minimum/maximum bin count.
         # Equal-width bins are only a display choice; the fit is unbinned.
+        bin_count = int(np.ceil(np.sqrt(len(values))))
         ax.hist(values, bins=np.linspace(values.min()-width*.12, values.max()+width*.12,
-                                        max(3, min(25, int(np.ceil(np.sqrt(len(values))))))+1),
-                density=True, color='#6aaed6', edgecolor='white', alpha=.65, label=f'Events (N={len(values)})')
+                                        bin_count+1),
+                density=True, color='#6aaed6', edgecolor='white', alpha=.65,
+                label=f'Events (N={len(values)}, {bin_count} bins)')
         ax.plot(values, np.zeros_like(values), '|', ms=12, color='#184b70', clip_on=False)
         if stats['fit_status'] == 'ok':
             x = np.linspace(min(values.min()-.2*width, mean-3*sigma),
@@ -552,8 +616,17 @@ def build_summary(reports, failures, args, output):
         ax.set_title('\n'.join(lines), fontsize=9, pad=10)
         ax.legend(loc='upper center', bbox_to_anchor=(.5, -.16), fontsize=7, ncol=2, frameon=False)
     label = f'CFD {args.fraction:.0%}' if method == 'constant_fraction' else f'{method} t0'
+    threshold = getattr(args, 'min_amplitude_mv', None)
+    maximum = getattr(args, 'max_amplitude_mv', None)
+    if threshold is not None and maximum is not None:
+        cut_label = f' · {threshold:g} ≤ both peaks ≤ {maximum:g} mV'
+    elif maximum is not None:
+        cut_label = f' · both peaks ≤ {maximum:g} mV'
+    else:
+        cut_label = f' · both peaks ≥ {threshold:g} mV' if threshold is not None else ''
     fig.suptitle(f'Muon velocity summary · {label} · L = {args.distance_m:g} m · shift = {args.offset_ns:g} ns\n'
-                 f'{len(usable)} velocities · {len(failures)} failed exports · {len(exclusions)} undefined velocities'
+                 f'{len(usable)} velocities · {len(rejected)} amplitude rejects · {len(failures)} failed exports · {len(exclusions)} undefined velocities'
+                 + cut_label
                  + (' · PRELIMINARY: very small sample' if len(usable) < 10 else ''), fontsize=10)
     fig.supxlabel('Statistical errors only; distance/offset systematics excluded. Gaussian speed and Gaussian time are different models.', fontsize=8)
     fig.savefig(prefix.with_suffix('.png'), dpi=110)
@@ -578,7 +651,7 @@ def main():
         parser.error('Multiple exports require --distance-m and --offset-ns to create the velocity summary.')
     output = args.output_dir or paths[0].parent / 'timing_results'
     output.mkdir(parents=True, exist_ok=True)
-    reports, failures = [], []
+    reports, failures, rejected = [], [], []
     for index, path in enumerate(paths, 1):
         print(f'\n[{index}/{len(paths)}] {path.name}')
         event_args = argparse.Namespace(**vars(args))
@@ -587,14 +660,22 @@ def main():
         event_args.headless = not args.show
         event_args.show = args.show and not batch
         try:
-            reports.append(analyze_event(event_args))
+            report = analyze_event(event_args)
+            reports.append(report)
+            selection = report['amplitude_selection'] or {'accepted': True, 'reason': 'No amplitude cut'}
+        except AmplitudeRejected as error:
+            selection = error.selection
+            rejected.append({'event': path.stem, **selection})
+            print(f'SKIPPED: {path.name}: {error}; peaks={selection["peak_amplitudes_mV"]}')
         except (ValueError, OSError, RuntimeError) as error:
             if not batch:
                 raise
             failures.append({'input': str(path), 'error': str(error)})
             print(f'FAILED: {path.name}: {error}')
+            continue
+        (output / f'{path.stem}_selection.json').write_text(json.dumps(selection, indent=2)+'\n')
     if batch:
-        build_summary(reports, failures, args, output)
+        build_summary(reports, failures, args, output, rejected)
     if failures:
         raise SystemExit(1)
 
