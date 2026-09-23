@@ -6,6 +6,7 @@ import csv
 import glob
 import json
 from pathlib import Path
+from datetime import datetime, timedelta
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -227,6 +228,8 @@ def clean_json(value):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('inputs', nargs='+', help='One or more CSV files, directories, or quoted glob patterns')
+    parser.add_argument('--rate-bin-hours', type=float, default=2.,
+                        help='Time-bin width for rate summary in hours (default: 2)')
     parser.add_argument('--fraction', type=float, default=.2)
     parser.add_argument('--min-amplitude-mv', type=float,
                         help='Require BOTH raw peak magnitudes above their baselines to be >= this value in mV; default: no amplitude cut')
@@ -242,6 +245,8 @@ def parse_args():
     parser.add_argument('--summary-method', choices=['constant_fraction', 'causal', 'gaussian'],
                         default='constant_fraction', help='Timing estimator used for the batch velocity histogram')
     args = parser.parse_args()
+    if not np.isfinite(args.rate_bin_hours) or args.rate_bin_hours <= 0:
+        parser.error('--rate-bin-hours must be finite and positive.')
     if args.min_amplitude_mv is not None and (not np.isfinite(args.min_amplitude_mv) or args.min_amplitude_mv < 0):
         parser.error('--min-amplitude-mv must be finite and nonnegative.')
     if args.max_amplitude_mv is not None and (not np.isfinite(args.max_amplitude_mv) or args.max_amplitude_mv < 0):
@@ -502,7 +507,7 @@ def gaussian_statistics(values):
     return result
 
 
-def build_summary(reports, failures, args, output, rejected=None):
+def build_summary(reports, failures, args, output, rejected=None, defer_display=False):
     rejected = rejected or []
     method = args.summary_method
     rows, exclusions = [], []
@@ -631,13 +636,146 @@ def build_summary(reports, failures, args, output, rejected=None):
     fig.supxlabel('Statistical errors only; distance/offset systematics excluded. Gaussian speed and Gaussian time are different models.', fontsize=8)
     fig.savefig(prefix.with_suffix('.png'), dpi=110)
     fig.savefig(prefix.with_suffix('.pdf'))
-    if args.show:
+    if args.show and not defer_display:
         plt.show()
-    plt.close(fig)
+    if not args.show or not defer_display:
+        plt.close(fig)
     if statistics is not None:
         print(f'Summary ({method}): N={statistics["n"]}, mean v/c={statistics["mean"]:.5f}, SEM={statistics["sem"]}')
     print(f'Summary files: {prefix}')
     return summary
+
+
+
+def read_event_timestamp(path):
+    """Use the instrument clock only, never mix it with file/export timestamps."""
+    for line in Path(path).read_text(encoding='utf-8-sig').splitlines():
+        if line.startswith('Timestamp:'):
+            body = line[len('Timestamp:'):].rstrip(':')
+            date, _, fraction = body.partition(',')
+            stamp = datetime.strptime(date, '%Y:%m:%d %H:%M %S')
+            digits = ''.join(c for c in fraction.split(' ')[0] if c.isdigit())
+            return stamp.replace(microsecond=int((digits+'000000')[:6]))
+    raise ValueError('Missing instrument Timestamp metadata')
+
+
+def rate_histogram(timestamps, selected, bin_hours):
+    """Common time edges and exposures for all/selected counts; rates per elapsed hour."""
+    if not timestamps:
+        return None
+    start, stop = min(timestamps), max(timestamps)
+    duration = (stop-start).total_seconds()/3600
+    if duration <= 0:
+        return None
+    nbin = int(np.ceil(duration/bin_hours))
+    if nbin > 10000:
+        raise ValueError('Rate bin width would create over 10000 bins; increase --rate-bin-hours.')
+    edges = np.minimum(np.arange(nbin+1)*bin_hours, duration)
+    times = np.array([(stamp-start).total_seconds()/3600 for stamp in timestamps])
+    total, _ = np.histogram(times, edges)
+    passed, _ = np.histogram(times[np.asarray(selected, dtype=bool)], edges)
+    exposure = np.diff(edges)
+    return {'start': start.isoformat(), 'stop': stop.isoformat(), 'elapsed_hours': duration,
+            'edges_hours': edges.tolist(), 'exposure_hours': exposure.tolist(),
+            'all_counts': total.tolist(), 'selected_counts': passed.tolist(),
+            'all_rate_per_hour': (total/exposure).tolist(),
+            'selected_rate_per_hour': (passed/exposure).tolist(),
+            'all_mean_per_hour': len(times)/duration,
+            'selected_mean_per_hour': int(np.sum(selected))/duration}
+
+
+def build_rate_summary(paths, args, output):
+    records, timestamps, selected = [], [], []
+    for path in paths:
+        record = {'event': path.stem, 'timestamp': None, 'accepted': None}
+        try:
+            stamp = read_event_timestamp(path)
+            record['timestamp'] = stamp.isoformat()
+        except (ValueError, OSError) as error:
+            record['error'] = str(error)
+            records.append(record)
+            continue
+        try:
+            # Selection is independent of successful pulse fitting and finite velocity.
+            t, y, labels, _ = load_rto(path)
+            end = args.baseline_end_ns if args.baseline_end_ns is not None else t[0]+.15*np.ptp(t)
+            cut = amplitude_selection(t, y, labels, end,
+                                      args.min_amplitude_mv, args.max_amplitude_mv)
+            record['accepted'] = cut['accepted']
+        except (ValueError, OSError, KeyError) as error:
+            record['error'] = str(error)
+        records.append(record)
+        timestamps.append(stamp)
+        selected.append(record['accepted'] is True)
+    histogram = rate_histogram(timestamps, selected, args.rate_bin_hours)
+    missing = sum(r['timestamp'] is None for r in records)
+    unknown = sum(r['timestamp'] is not None and r['accepted'] is None for r in records)
+    report = {'bin_hours': args.rate_bin_hours, 'min_amplitude_mV': args.min_amplitude_mv,
+              'max_amplitude_mV': args.max_amplitude_mv, 'events': records,
+              'missing_timestamps': missing, 'unknown_selection': unknown,
+              'histogram': histogram,
+              'note': 'Rates use elapsed time between first/last instrument timestamps, not measured live time. '
+                      'Selected means amplitude cuts passed, independently of fit success. '
+                      'Gaps are treated as exposure; no dead-time correction.'}
+    prefix = output / 'summary_rate'
+    prefix.with_suffix('.json').write_text(json.dumps(report, indent=2)+'\n')
+    with prefix.with_suffix('.csv').open('w', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(['start', 'stop', 'elapsed_hours', 'all_count', 'selected_count',
+                         'all_per_hour', 'selected_per_hour'])
+        if histogram:
+            origin = datetime.fromisoformat(histogram['start'])
+            for i, exposure in enumerate(histogram['exposure_hours']):
+                writer.writerow([(origin+timedelta(hours=histogram['edges_hours'][i])).isoformat(),
+                                 (origin+timedelta(hours=histogram['edges_hours'][i+1])).isoformat(),
+                                 exposure, histogram['all_counts'][i], histogram['selected_counts'][i],
+                                 histogram['all_rate_per_hour'][i], histogram['selected_rate_per_hour'][i]])
+    import matplotlib
+    if not args.show:
+        matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    fig, axes = plt.subplots(2, 1, figsize=(11, 6.5), dpi=110,
+                             sharex=True, layout='constrained')
+    low = f'{args.min_amplitude_mv:g}' if args.min_amplitude_mv is not None else '0'
+    high = f'{args.max_amplitude_mv:g}' if args.max_amplitude_mv is not None else '∞'
+    for ax, key, label, color in [(axes[0], 'all', 'All input acquisitions', '#899aa9'),
+                                   (axes[1], 'selected', f'Amplitude selection: {low}–{high} mV in both channels', '#1674b1')]:
+        ax.set(ylabel='Events / hour', title=label)
+        ax.grid(axis='y', alpha=.2)
+        if histogram is None:
+            ax.text(.5, .5, 'Rate undefined: need at least two distinct valid timestamps',
+                    ha='center', transform=ax.transAxes, fontsize=9)
+            continue
+        origin = datetime.fromisoformat(histogram['start'])
+        edges = np.array(histogram['edges_hours'])
+        exposure = np.array(histogram['exposure_hours'])
+        centers = [origin+timedelta(hours=float(h)) for h in (edges[:-1]+edges[1:])/2]
+        counts = np.array(histogram[key+'_counts'])
+        rate = np.array(histogram[key+'_rate_per_hour'])
+        ax.bar(centers, rate, width=exposure/24*.9, color=color, alpha=.8)
+        ax.errorbar(centers, rate, yerr=np.sqrt(counts)/exposure, fmt='none',
+                    color='black', lw=.8, capsize=3)
+        ax.axhline(histogram[key+'_mean_per_hour'], color='#c8443c', ls='--', lw=1,
+                   label=f'Mean {histogram[key+"_mean_per_hour"]:.2f}/h · N={int(counts.sum())}')
+        ax.legend(loc='upper center', fontsize=8)
+        if len(counts) <= 30:
+            for x, v, n in zip(centers, rate, counts):
+                ax.annotate(str(n), (x, v), xytext=(0, 4), textcoords='offset points', ha='center', fontsize=7)
+    if histogram:
+        locator = mdates.AutoDateLocator(minticks=4, maxticks=10)
+        axes[1].xaxis.set_major_locator(locator)
+        axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%d/%m\n%H:%M'))
+    axes[1].set_xlabel('Oscilloscope metadata time')
+    fig.suptitle(f'Event rate over time · {args.rate_bin_hours:g} h bins · '
+                 f'{missing} missing timestamps · {unknown} unknown selections', fontsize=11)
+    fig.supxlabel('Elapsed-time rates, not live-time corrected; last bin normalized to its actual duration. Errors: √N.', fontsize=8)
+    fig.savefig(prefix.with_suffix('.png'), dpi=110)
+    fig.savefig(prefix.with_suffix('.pdf'))
+    if not args.show:
+        plt.close(fig)
+    print(f'Rate summary files: {prefix}')
+    return report
 
 
 def main():
@@ -675,7 +813,12 @@ def main():
             continue
         (output / f'{path.stem}_selection.json').write_text(json.dumps(selection, indent=2)+'\n')
     if batch:
-        build_summary(reports, failures, args, output, rejected)
+        build_summary(reports, failures, args, output, rejected, defer_display=True)
+        build_rate_summary(paths, args, output)
+        if args.show:
+            import matplotlib.pyplot as plt
+            plt.show()
+            plt.close('all')
     if failures:
         raise SystemExit(1)
 
