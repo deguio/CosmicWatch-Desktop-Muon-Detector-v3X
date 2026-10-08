@@ -1,0 +1,68 @@
+; Trigger and coincidence front-end.
+;
+;   IN  base : comparator output (GPIO22)
+;   SET base : our coincidence line (1 pin). The output latch is kept at 0 and
+;              only the pin direction is toggled, so the line is driven
+;              open-drain style and two boards can never fight over it.
+;   JMP pin  : the partner's coincidence line (pulled up on both boards).
+;
+; Per event the state machine pushes two words to the RX FIFO:
+;   0xFFFFFFFF immediately after the trigger edge (the CPU takes the timestamp)
+;   0 or 1     after the coincidence window (1 = partner line seen low)
+; It then waits for the CPU to re-arm it with any word in the TX FIFO, which
+; happens after the ADC conversion and the peak-detector reset.
+;
+; Timing at 125 MHz: 32 samples x 12 cycles = 384 cycles = 3.07 us. Our own
+; line is held low for the same window, so two boards flag an event as
+; coincident when their triggers are within ~3 us of each other.
+
+.program cw_daq
+.wrap_target
+    pull block              ; wait for (re-)arm from the CPU
+    wait 0 pin 0            ; comparator must be low before arming
+public armed:
+    wait 1 pin 0            ; trigger edge
+    set pindirs, 1          ; pull our coincidence line low
+    mov isr, ~null
+    push block              ; trigger marker -> CPU timestamps the event
+    set y, 0
+    set x, 31
+sample:
+    jmp pin, line_high [5]
+    set y, 1                ; partner line is low: coincidence
+line_high:
+    jmp x-- sample [5]
+    set pins, 1             ; drive high briefly for a fast rising edge
+    set pindirs, 0          ; release the line (pull-ups keep it high)
+    set pins, 0             ; restore the output latch
+    mov isr, y
+    push block              ; coincidence flag
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+// Cycles spent sampling the partner line (see the timing note above).
+#define CW_DAQ_WINDOW_CYCLES (32u * 12u)
+
+static inline void cw_daq_program_init(PIO pio, uint sm, uint offset, uint pin_trigger,
+                                       int pin_out, uint pin_in) {
+    pio_sm_config c = cw_daq_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_trigger);
+    sm_config_set_jmp_pin(&c, pin_in);
+    if (pin_out >= 0) {
+        sm_config_set_set_pins(&c, (uint)pin_out, 1);
+        pio_gpio_init(pio, (uint)pin_out);
+        gpio_pull_up((uint)pin_out);
+        pio_sm_set_pins_with_mask(pio, sm, 0u, 1u << pin_out);
+        pio_sm_set_pindirs_with_mask(pio, sm, 0u, 1u << pin_out);
+    } else {
+        // Single mode: SET still needs a base, point it at the trigger input.
+        // The pin is not muxed to the PIO, so the SET instructions have no effect.
+        sm_config_set_set_pins(&c, pin_trigger, 1);
+    }
+    sm_config_set_clkdiv(&c, 1.0f);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_NONE);
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}
