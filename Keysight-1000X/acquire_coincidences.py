@@ -108,8 +108,9 @@ def parse_args(argv=None):
     run.add_argument('--save-rejected', action='store_true', help='Also save triggers failing the cut, in rejected/')
     run.add_argument('--max-events', type=int, help='Stop after this many saved coincidences')
     run.add_argument('--duration-h', type=float, help='Stop after this many hours')
-    run.add_argument('--poll-s', type=float, default=.05, help='Polling interval while armed (default: 0.05)')
-    run.add_argument('--status-s', type=float, default=300., help='Interval between status lines (default: 300)')
+    run.add_argument('--poll-s', type=float, default=.25, help='Polling interval while armed (default: 0.25)')
+    run.add_argument('--status-s', type=float, default=300.,
+                     help='Status line and session file update, also while waiting (default: 300)')
     run.add_argument('--max-reconnects', type=int,
                      help='Consecutive failed reconnections before giving up (default: unlimited)')
     run.add_argument('--check', action='store_true', help='Apply the requested settings, print the readback and exit')
@@ -221,10 +222,14 @@ def open_scope(args):
         manager = pyvisa.ResourceManager(args.visa_library)
         scope = None
         try:
+            # USB: start from a clean USBTMC state whatever a previous session left.
+            usbtmc_clear(resource)
             scope = manager.open_resource(resource)
             scope.timeout = args.timeout_ms
             scope.read_termination = scope.write_termination = '\n'
-            drain(scope)
+            if not resource.upper().startswith('USB'):
+                drain(scope)  # reading with nothing pending is not harmless on USBTMC
+            error_queue(scope)  # e.g. -310 left by an interrupted transfer
             yield scope
         finally:
             if scope is not None:
@@ -347,8 +352,11 @@ def setting_warnings(settings):
     return notes
 
 
-def wait_for_trigger(scope, poll_s, deadline=None, arm_timeout_s=5.):
-    """Arm one acquisition and wait for it; return the armed (live) time, None if none."""
+def wait_for_trigger(scope, poll_s, deadline=None, arm_timeout_s=5., on_idle=None):
+    """Arm one acquisition and wait for it; return the armed (live) time, None if none.
+
+    on_idle(armed_s) is called at every poll, e.g. for a heartbeat during hours-long waits.
+    """
     scope.query(':AER?')  # arm and trigger event registers clear on read
     scope.query(':TER?')
     scope.write(':SINGle')
@@ -363,6 +371,8 @@ def wait_for_trigger(scope, poll_s, deadline=None, arm_timeout_s=5.):
         if deadline is not None and time.monotonic() >= deadline:
             scope.write(':STOP')
             return None
+        if on_idle is not None:
+            on_idle(time.monotonic() - armed)
         time.sleep(poll_s)
     live = time.monotonic() - armed
     # Stopped from the front panel, for example, rather than triggered.
@@ -457,6 +467,59 @@ class EventLog:
         self.stream.close()
 
 
+def usbtmc_clear(resource):
+    """USBTMC device clear: INITIATE_CLEAR, CHECK_CLEAR_STATUS, then clear the bulk halts.
+
+    pyvisa-py has no device clear on USB, and a transfer left half done (timeout,
+    Ctrl-C) leaves the DSOX1202A refusing every later command with write timeouts;
+    a USB port reset does not recover it, this does (verified 9 Oct 2026).
+    The acquisition in progress on the oscilloscope is not touched.
+    """
+    parts = (resource or '').split('::')
+    if len(parts) < 4 or not parts[0].upper().startswith('USB'):
+        return
+    try:
+        import usb.core
+        import usb.util
+        vendor, product, serial = int(parts[1], 0), int(parts[2], 0), parts[3]
+        try:
+            import libusb_package
+            devices = list(libusb_package.find(find_all=True, idVendor=vendor, idProduct=product))
+        except ImportError:
+            devices = list(usb.core.find(find_all=True, idVendor=vendor, idProduct=product))
+        for device in devices:
+            try:
+                if device.serial_number != serial:
+                    continue
+                interface = next(i for i in device.get_active_configuration()
+                                 if i.bInterfaceClass == 0xFE and i.bInterfaceSubClass == 3)
+                number = interface.bInterfaceNumber
+                usb.util.claim_interface(device, number)
+                # Class requests, recipient interface: 5 INITIATE_CLEAR, 6 CHECK_CLEAR_STATUS (2 = pending).
+                device.ctrl_transfer(0xA1, 5, 0, number, 1, timeout=5000)
+                for _ in range(100):
+                    if device.ctrl_transfer(0xA1, 6, 0, number, 2, timeout=5000)[0] != 2:
+                        break
+                    time.sleep(.05)
+                for endpoint in interface:
+                    if usb.util.endpoint_type(endpoint.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK:
+                        device.clear_halt(endpoint.bEndpointAddress)
+                usb.util.release_interface(device, number)
+            finally:
+                usb.util.dispose_resources(device)
+    except Exception as error:  # best effort: opening the session is attempted anyway
+        print(f'USBTMC clear not possible: {error!r}', flush=True)
+
+
+def pending_trigger(scope, unread=False):
+    """True if the stopped oscilloscope holds a triggered acquisition not yet saved:
+    one that arrived while the connection was down, or whose readout failed (unread)."""
+    if as_int(scope.query(':OPERegister:CONDition?')) & RUN_BIT:
+        return False
+    triggered = bool(as_int(scope.query(':TER?')))  # read anyway: it clears on read
+    return unread or triggered
+
+
 def prepare(scope, args, session):
     idn = scope.query('*IDN?').strip()
     print(f'Connected: {idn}', flush=True)
@@ -489,89 +552,130 @@ def acquire(args, connect=open_scope):
     stem = output / f'session_{started:%Y%m%d_%H%M%S}'
     session = {'started': started.isoformat(timespec='seconds'), 'command': sys.argv,
                'args': vars(args), 'first_index': log.next_index}
-    counts = {'triggers': 0, 'accepted': 0, 'rejected': 0, 'reconnects': 0}
-    live = 0.
-    begin = time.monotonic()
-    deadline = begin + args.duration_h * 3600 if args.duration_h else None
-    last_status = begin
+    counts = {'triggers': 0, 'accepted': 0, 'rejected': 0, 'reconnects': 0, 'recovered': 0}
+    # unread: live time of a triggered acquisition not yet saved (None if there is none).
+    state = {'live': 0., 'armed': 0., 'last_status': time.monotonic(), 'last_event': None, 'unread': None}
+    deadline = time.monotonic() + args.duration_h * 3600 if args.duration_h else None
     failures = 0
     connected_once = False
+    resource = None
 
     def finished():
         return ((args.max_events is not None and counts['accepted'] >= args.max_events) or
                 (deadline is not None and time.monotonic() >= deadline))
 
     def write_session(stopped=None):
-        session.update(counts=counts, live_time_s=live, last_index=log.next_index - 1)
+        session.update(counts=counts, live_time_s=state['live'] + state['armed'],
+                       last_index=log.next_index - 1, last_event=state['last_event'],
+                       updated=datetime.now().astimezone().isoformat(timespec='seconds'))
         if stopped:
             session['stopped'] = stopped
         stem.with_suffix('.json').write_text(json.dumps(session, indent=2, default=str) + '\n')
+
+    def status(armed=0.):
+        """Heartbeat, also during hours without triggers."""
+        state['armed'] = armed
+        if time.monotonic() - state['last_status'] < args.status_s:
+            return
+        state['last_status'] = time.monotonic()
+        live = state['live'] + armed
+        rate = counts['accepted'] / live * 3600 if live else float('nan')
+        print(f'--- {datetime.now():%Y-%m-%d %H:%M:%S} alive: {counts["triggers"]} triggers, '
+              f'{counts["accepted"]} saved, live {live/3600:.2f} h, {rate:.2f} coincidences/h, '
+              f'last event {state["last_event"] or "none"} ---', flush=True)
+        write_session()
+
+    def record(scope, armed):
+        """Read, select, save and log the stopped acquisition; armed=None if unknown."""
+        done = time.monotonic()
+        stamp = datetime.now().astimezone()
+        window = None if args.full_record else args.window_ns
+        t, y, limits = read_event(scope, window)
+        amplitudes = peak_amplitudes(t, y, args.polarity, args.baseline_end_ns)
+        accepted = args.min_amplitude_mv is None or all(
+            a >= cut for a, cut in zip(amplitudes, args.min_amplitude_mv))
+        index, name = log.claim_name()
+        relative = name if accepted else f'rejected/{name}' if args.save_rejected else ''
+        if relative:
+            write_keysight_csv(output / relative, t, y)
+        counts['triggers'] += 1
+        counts['accepted' if accepted else 'rejected'] += 1
+        state['last_event'] = stamp.isoformat(timespec='seconds')
+        log.append({'index': index, 'file': relative, 'accepted': int(accepted),
+                    'pc_time': stamp.replace(tzinfo=None).isoformat(timespec='milliseconds'),
+                    'utc_time': stamp.astimezone(timezone.utc).isoformat(timespec='milliseconds'),
+                    'live_s': '' if armed is None else f'{armed:.3f}',
+                    'readout_s': f'{time.monotonic()-done:.3f}',
+                    'amplitude1_mV': f'{amplitudes[0]:.2f}', 'amplitude2_mV': f'{amplitudes[1]:.2f}',
+                    'adc_limit1': limits[0], 'adc_limit2': limits[1],
+                    'points': len(t), 'dt_ns': f'{t[1]-t[0]:.6g}'})
+        state['unread'] = None  # logged: a later failure must not save it twice
+        live = 'unknown (recovered)' if armed is None else f'{armed:8.1f} s'
+        print(f'{stamp:%Y-%m-%d %H:%M:%S} #{index} C1 {amplitudes[0]:6.1f} mV  '
+              f'C2 {amplitudes[1]:6.1f} mV  live {live}  {relative or "rejected, not saved"}'
+              f'{"  ADC LIMIT" if any(limits) else ""}', flush=True)
+        write_session()
+
+    def log_error(error):
+        with (output / 'errors.log').open('a') as stream:
+            stream.write(f'{datetime.now().astimezone().isoformat(timespec="seconds")} {error!r}\n')
 
     print(f'Run directory: {output.resolve()} (next event {log.next_index})', flush=True)
     try:
         while not finished():
             try:
                 with connect(args) as scope:
+                    resource = getattr(scope, 'resource_name', resource)
+                    # After an outage, save a trigger that arrived meanwhile before re-arming.
+                    rescue = connected_once and pending_trigger(scope, state['unread'] is not None)
                     prepare(scope, args, session)
                     if not connected_once:
                         save_setup(scope, stem.with_name(stem.name + '_setup.bin'))
                     connected_once, failures = True, 0
                     write_session()
+                    if rescue:
+                        counts['recovered'] += 1
+                        record(scope, state['unread'] or None)
+                    state['unread'] = None
                     print('Waiting for triggers (Ctrl-C to stop) ...', flush=True)
                     while not finished():
-                        armed = wait_for_trigger(scope, args.poll_s, deadline)
+                        armed = wait_for_trigger(scope, args.poll_s, deadline, on_idle=status)
+                        state['armed'] = 0.
                         if armed is None:
                             continue
-                        live += armed
-                        done = time.monotonic()
-                        stamp = datetime.now().astimezone()
-                        window = None if args.full_record else args.window_ns
-                        t, y, limits = read_event(scope, window)
-                        amplitudes = peak_amplitudes(t, y, args.polarity, args.baseline_end_ns)
-                        accepted = args.min_amplitude_mv is None or all(
-                            a >= cut for a, cut in zip(amplitudes, args.min_amplitude_mv))
-                        index, name = log.claim_name()
-                        relative = name if accepted else f'rejected/{name}' if args.save_rejected else ''
-                        if relative:
-                            write_keysight_csv(output / relative, t, y)
-                        counts['triggers'] += 1
-                        counts['accepted' if accepted else 'rejected'] += 1
-                        log.append({'index': index, 'file': relative, 'accepted': int(accepted),
-                                    'pc_time': stamp.replace(tzinfo=None).isoformat(timespec='milliseconds'),
-                                    'utc_time': stamp.astimezone(timezone.utc).isoformat(timespec='milliseconds'),
-                                    'live_s': f'{armed:.3f}', 'readout_s': f'{time.monotonic()-done:.3f}',
-                                    'amplitude1_mV': f'{amplitudes[0]:.2f}', 'amplitude2_mV': f'{amplitudes[1]:.2f}',
-                                    'adc_limit1': limits[0], 'adc_limit2': limits[1],
-                                    'points': len(t), 'dt_ns': f'{t[1]-t[0]:.6g}'})
-                        print(f'{stamp:%Y-%m-%d %H:%M:%S} #{index} C1 {amplitudes[0]:6.1f} mV  '
-                              f'C2 {amplitudes[1]:6.1f} mV  live {armed:8.1f} s  '
-                              f'{relative or "rejected, not saved"}'
-                              f'{"  ADC LIMIT" if any(limits) else ""}', flush=True)
-                        if time.monotonic() - last_status >= args.status_s:
-                            last_status = time.monotonic()
-                            rate = counts['accepted'] / live * 3600 if live else float('nan')
-                            print(f'--- {counts["triggers"]} triggers, {counts["accepted"]} saved, '
-                                  f'live {live/3600:.2f} h, {rate:.2f} coincidences/h live ---', flush=True)
-                            write_session()
+                        state['live'] += armed
+                        state['unread'] = armed
+                        record(scope, armed)
+                        state['unread'] = None
+                        status()
             except ConfigurationError:
                 raise
             except RECOVERABLE as error:
                 if not connected_once:
                     raise
+                # Live time accumulated before the failure still counts.
+                state['live'] += state['armed']
+                state['armed'] = 0.
                 failures += 1
                 counts['reconnects'] += 1
+                log_error(error)
                 if args.max_reconnects is not None and failures > args.max_reconnects:
                     raise
                 delay = min(60, 2 ** failures)
-                print(f'Communication error: {error!r}. Reconnecting in {delay} s ...', flush=True)
-                time.sleep(delay)
+                print(f'{datetime.now():%Y-%m-%d %H:%M:%S} communication error: {error!r}. '
+                      f'Reconnecting in {delay} s ...', flush=True)
+                usbtmc_clear(resource)
+                write_session()
+                time.sleep(max(delay, 5))  # also lets the device re-enumerate after the reset
     except KeyboardInterrupt:
         print('\nStopped by user.', flush=True)
     finally:
         log.close()
         write_session(stopped=datetime.now().astimezone().isoformat(timespec='seconds'))
+    live = state['live'] + state['armed']
     print(f'{counts["triggers"]} triggers, {counts["accepted"]} saved coincidences, '
-          f'{counts["rejected"]} rejected, live time {live/3600:.3f} h.', flush=True)
+          f'{counts["rejected"]} rejected, {counts["recovered"]} recovered after reconnection, '
+          f'live time {live/3600:.3f} h.', flush=True)
     return counts
 
 

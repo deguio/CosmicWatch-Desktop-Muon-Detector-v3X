@@ -147,11 +147,46 @@ passo di polling (`--poll-s`, default 50 ms). La somma dei `live_s` è il tempo
 vivo per il calcolo del rate. Il tempo morto è dato dalle letture e dalle pause
 di riconnessione.
 
-In caso di errore di comunicazione durante la presa dati, lo script chiude la
-sessione e ritenta con attesa crescente fino a 60 s, senza limite salvo
-`--max-reconnects`. Se le impostazioni lette dopo una riconnessione differiscono
-da quelle iniziali, lo segnala e le registra nel JSON della sessione. Un errore
-alla prima connessione, o un'impostazione rifiutata dallo strumento, interrompe subito.
+In caso di errore di comunicazione durante la presa dati, lo script:
+
+1. scrive l'errore, con data e ora, in `errors.log` nella cartella della presa dati;
+2. via USB esegue il device clear USBTMC (INITIATE_CLEAR, CHECK_CLEAR_STATUS,
+   sblocco degli endpoint), che pyvisa-py non implementa; l'acquisizione in corso
+   sull'oscilloscopio non viene toccata;
+3. riapre la sessione con attesa crescente fino a 60 s, senza limite salvo
+   `--max-reconnects`;
+4. **prima di riarmare**, se l'oscilloscopio è fermo con un trigger arrivato
+   durante l'interruzione, o con un evento la cui lettura era fallita, legge e
+   salva quell'evento. In `events.csv` il suo `live_s` è vuoto se il tempo vivo
+   non è noto; il conteggio `recovered` del JSON di sessione li riporta.
+
+Se le impostazioni lette dopo una riconnessione differiscono da quelle iniziali,
+lo script lo segnala e le registra nel JSON della sessione. Un errore alla prima
+connessione, o un'impostazione rifiutata dallo strumento, interrompe subito.
+
+### Prese dati lunghe con pochi eventi
+
+Via USB lo script esegue il clear USBTMC anche **a ogni apertura** della
+connessione. Il 9 ottobre 2026 un trasferimento rimasto a metà aveva lasciato il
+DSOX1202A in uno stato in cui ogni comando successivo andava in timeout in
+scrittura (`[Errno 60] Operation timed out` su macOS, timeout USB su Linux),
+anche dopo aver rilanciato lo script; il reset della porta USB non bastava, il
+clear USBTMC sì. Nello stesso giorno un'attesa di 296 s senza trigger, con
+interrogazione ogni 0.25 s, si è conclusa regolarmente con il salvataggio
+dell'evento.
+
+Ogni `--status-s` (default 300 s) lo script stampa una riga `alive` e aggiorna
+il JSON di sessione (`updated`, `last_event`, conteggi, tempo vivo) **anche
+mentre aspetta il trigger**: l'ora di `updated` distingue "nessun muone" da
+"acquisizione ferma". Lo stato viene interrogato ogni `--poll-s` (default 0.25 s).
+
+Sul PC Linux disattivare la sospensione automatica (GNOME sospende di default
+dopo circa 15 minuti di inattività, e al risveglio la comunicazione USB va in
+timeout):
+
+```bash
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+```
 
 ## Analisi
 
