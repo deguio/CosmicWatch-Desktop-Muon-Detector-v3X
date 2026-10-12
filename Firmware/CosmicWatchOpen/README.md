@@ -6,7 +6,8 @@ progetto. Sostituisce `CosmicWatch_v3X.1.1.52.uf2` mantenendo lo stesso formato
 dei dati: `import_data.py`, la GUI e gli script in `Data/` funzionano senza modifiche.
 
 La logica del firmware è descritta in dettaglio in [FIRMWARE.md](FIRMWARE.md); il piano
-di verifica e calibrazione è in [PIANO_MISURE.md](PIANO_MISURE.md).
+di verifica e calibrazione è in [PIANO_MISURE.md](PIANO_MISURE.md); i punti aperti dopo il
+confronto con il firmware originale sono in [PIANO_VALIDAZIONE.md](PIANO_VALIDAZIONE.md).
 
 > **Stato:** compila senza warning e la logica è verificata con test su host e
 > simulazione del PIO, ma **non è ancora stato provato su un detector reale**.

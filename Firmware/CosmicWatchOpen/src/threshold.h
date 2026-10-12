@@ -18,5 +18,6 @@ void threshold_set_mV(float mV);
 float threshold_get_set_mV(void);
 // Read back the threshold through ADC1, mV.
 float threshold_measure_mV(void);
-// Small closed-loop correction after a measurement.
+// Small closed-loop correction after a measurement; it is remembered and also
+// applied by later threshold_set_mV() calls.
 void threshold_trim(float target_mV, float measured_mV);

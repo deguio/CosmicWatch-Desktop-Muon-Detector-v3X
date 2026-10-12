@@ -180,6 +180,8 @@ static void outputs_service(uint32_t now) {
 
 // ======================================================================== OLED
 
+static int oled_page = -1;   // next page to send during the run, -1 = idle
+
 static void fmt_rate(char *b, size_t n, const char *label, double count, double live_s) {
     if (live_s <= 0) live_s = 1e-9;
     double r = count / live_s, e = sqrt(count) / live_s;
@@ -221,7 +223,13 @@ static void oled_update(uint32_t now_ms) {
         snprintf(l, sizeof l, "Dead %.3f%%", run_s > 0 ? 100.0 * (run_s - live_s) / run_s : 0.0);
         oled_text(line++, x, l);
     }
-    oled_flush();
+    oled_page = 0;   // sent one page per main-loop iteration (oled_service)
+}
+
+static void oled_service(void) {
+    if (oled_page < 0) return;
+    oled_flush_page(oled_page);
+    if (++oled_page == 8) oled_page = -1;
 }
 
 static void oled_message(const char *a, const char *b, const char *c) {
@@ -375,6 +383,8 @@ static void housekeeping(uint32_t now) {
     static uint32_t t_imu, t_env, t_hk, t_base, t_oled, t_gain, t_hb, t_hkline;
     static uint32_t hb_last;
     static float corr_logged = 1.0f;
+    static float thr_acc;      // 1-s threshold readings since the last trim
+    static uint32_t thr_n;
 
     if (has_imu && now - t_imu >= 100) {
         t_imu = now;
@@ -390,6 +400,10 @@ static void housekeeping(uint32_t now) {
         float v = measure_hv();
         if (v > 0) hv_V = v;
         thr_meas_mV = threshold_measure_mV();
+        if (thr_meas_mV > 0) {
+            thr_acc += thr_meas_mV;
+            thr_n++;
+        }
     }
     // ~63 us of dead time per sample: one every 5 s (12 per default HK period)
     if (now - t_base >= 5000) {
@@ -403,21 +417,25 @@ static void housekeeping(uint32_t now) {
     }
     if (now - t_gain >= 10000) {
         t_gain = now;
-        bool changed = false;
-        // only with a recent, filtered temperature
+        // 1) closed-loop trim against drifts of the 3.3 V PWM level, on the mean
+        //    of the ~10 readings since the last round (640 conversions, noise
+        //    ~0.07 mV): a single 64-sample reading (~0.2 mV rms) would make the
+        //    trim chase noise. The threshold has not changed since then.
+        if (thr_n >= 5) {
+            float target = threshold_get_set_mV();
+            float m = thr_acc / (float)thr_n;
+            if (fabsf(m - target) > 0.3f) threshold_trim(target, m);
+        }
+        thr_acc = 0;
+        thr_n = 0;
+        // 2) gain correction, only with a recent filtered temperature; the new
+        //    threshold keeps the trim accumulated so far
         if (cfg.use_gain_correction && env.ok && now - env_ok_ms < 30000) {
             float c = gain_model();
             if (c > 0.8f && c < 1.25f && fabsf(c - gain_corr) > 1e-4f) {
                 gain_corr = c;
                 apply_threshold();
-                changed = true;   // RC filter needs time: trim at the next round
             }
-        }
-        // keep the threshold on target against drifts of the 3.3 V PWM level
-        if (!changed) {
-            float target = threshold_get_set_mV();
-            float m = threshold_measure_mV();
-            if (m > 0 && fabsf(m - target) > 0.3f) threshold_trim(target, m);
         }
         if (fabsf(gain_corr - corr_logged) > 0.002f) {
             corr_logged = gain_corr;
@@ -560,7 +578,7 @@ static void measure_baseline(float *mean, float *sd) {
 }
 
 static void boot(void) {
-    bool wd = watchdog_caused_reboot();
+    bool wd = watchdog_enable_caused_reboot();   // false after a UF2 flash or a reboot command
     stdio_init_all();
 
     gpio_init(PIN_PEAK_RESET);
@@ -766,6 +784,7 @@ int main(void) {
         while (k++ < 64 && daq_pop(&ev)) process_event(&ev);
         uint32_t now = ms_since_boot();
         outputs_service(now);
+        oled_service();
         usb_service();
         housekeeping(now);
         sd_service(now);

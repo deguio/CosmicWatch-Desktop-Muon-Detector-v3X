@@ -262,10 +262,17 @@ con 3 Hz su entrambi i detector fa 5.4·10⁻⁵ Hz.
 ### 6.4 Durante il run
 - **Lettura:** ogni 1 s la soglia viene misurata (64 conversioni) e mostrata
   sull'OLED.
-- **Trim in anello chiuso:** ogni 10 s, se |misurata − impostata| > 0.3 mV, il
-  duty viene corretto. Compensa le derive dei 3.3 V che alimentano il PWM. L'ADC
-  è riferito all'LM4040, più stabile. Il trim viene saltato nel giro in cui la
-  correzione in temperatura ha appena spostato la soglia.
+- **Trim in anello chiuso:** ogni 10 s, se la media delle letture da 1 s
+  raccolte nel frattempo (~10 × 64 conversioni) differisce di più di 0.3 mV
+  dalla soglia impostata, il duty viene corretto. Una singola lettura ha un
+  rumore di circa 0.2 mV rms (misurato su DIECI), quindi usarla direttamente
+  farebbe inseguire il rumore al trim; la media scende a circa 0.07 mV. Compensa le derive dei 3.3 V che alimentano il PWM. L'ADC
+  è riferito all'LM4040, più stabile.
+  - La correzione si accumula (al massimo ±0.02 di duty, cioè circa ±30 mV) e
+    resta valida anche quando la soglia viene reimpostata, dalla correzione in
+    temperatura o dal comando `threshold`.
+  - In ogni giro da 10 s il trim viene fatto prima della correzione in
+    temperatura.
 
 ---
 
@@ -330,7 +337,7 @@ compare sia al numeratore sia al denominatore.
 | Baseline (ADC0, PIO fermo) | 5 s | core 1 | 1 conversione, ~63 µs di tempo morto |
 | Correzione in temperatura e trim della soglia | 10 s | core 0 | il trim fa altre 64 conversioni ADC1 |
 | Riga HK | `HK_PERIOD_S`, 60 s di default | core 0 | anche all'avvio e quando c cambia |
-| OLED | 1 s | core 0, I²C | circa 25 ms per il frame completo |
+| OLED | 1 s | core 0, I²C | il frame viene inviato una pagina (8 righe di pixel) per giro del ciclo principale, circa 3 ms ciascuna, così gli eventi non aspettano i ~25 ms del frame intero |
 | Scrittura del buffer SD | 1 s, oppure con 8 kB in attesa | core 0, SPI | `f_sync` ogni 10 s |
 | Watchdog | 0.5 s | core 0 | aggiornato solo se anche il core 1 è vivo |
 | LED, buzzer | 20 ms dopo l'evento | core 0 | spegnimento |

@@ -26,6 +26,7 @@ static uint32_t wrap;            // PWM counts per period
 static threshold_fit_t fit;
 static float set_mV;
 static float set_duty;
+static float trim_duty;   // accumulated closed-loop correction, kept across threshold_set_mV()
 
 static void dma_restart_irq(void) {
     if (dma_channel_get_irq0_status((uint)dma_ch)) {
@@ -130,7 +131,7 @@ void threshold_set_mV(float mV) {
     set_mV = mV;
     float a = fit.ok ? fit.slope_mV : 1650.0f;
     float b = fit.ok ? fit.offset_mV : 0.0f;
-    fill_table((mV - b) / a);
+    fill_table((mV - b) / a + trim_duty);
 }
 
 float threshold_get_set_mV(void) { return set_mV; }
@@ -138,5 +139,9 @@ float threshold_get_set_mV(void) { return set_mV; }
 void threshold_trim(float target_mV, float measured_mV) {
     float a = fit.ok ? fit.slope_mV : 1650.0f;
     float d = (target_mV - measured_mV) / a;
-    if (fabsf(d) < 0.01f) fill_table(set_duty + d);
+    if (fabsf(d) >= 0.01f) return;   // > ~16 mV: not a drift, leave it alone
+    trim_duty += d;
+    if (trim_duty > 0.02f) trim_duty = 0.02f;
+    if (trim_duty < -0.02f) trim_duty = -0.02f;
+    fill_table(set_duty + d);
 }
