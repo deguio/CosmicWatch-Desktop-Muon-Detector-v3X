@@ -29,8 +29,13 @@ cartella sopra la radice del repository):
 source ../../venv_cosmicwatch.nosync/bin/activate   # dalla radice del repository
 ```
 
-Servono numpy, scipy, pandas, matplotlib e pyserial (acquisizione); per il
-Keysight anche pyvisa e pyvisa-py.
+I pacchetti necessari sono elencati in [`../requirements.txt`](../requirements.txt),
+divisi per uso: analisi, acquisizione USB, Keysight, RTO6, notebook, GUI.
+Per un venv nuovo:
+
+```bash
+python -m pip install -r requirements.txt            # dalla radice del repository
+```
 
 **Flusso dei dati.**
 
