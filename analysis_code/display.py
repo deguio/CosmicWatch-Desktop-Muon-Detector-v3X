@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Event display 2D per la torre CosmicWatch a nove scintillatori.
+"""Event display 2D per una torre CosmicWatch con fino a nove scintillatori.
 
 Le coincidenze sono ricostruite usando le colonne Time/Date assegnate dal PC,
 perche' nel file ``coincidence_nine.txt`` il flag Coincident vale sempre zero.
@@ -472,6 +472,10 @@ def print_summary(
     skipped: int,
 ) -> None:
     detector_counts = Counter(hit.device for hit in display_hits)
+    devices_in_file = {hit.device for hit in all_hits}
+    available_devices = tuple(
+        device for device in DEVICE_NAMES if device in devices_in_file
+    )
     multiplicities = Counter(event.multiplicity for event in coincidences)
     firmware_coincident = sum(hit.coincident_flag for hit in all_hits)
     live_time_s = (
@@ -487,8 +491,15 @@ def print_summary(
     )
     print(
         "Hit selezionati per device: "
-        + ", ".join(f"{name}={detector_counts[name]}" for name in DEVICE_NAMES)
+        + ", ".join(
+            f"{name}={detector_counts[name]}" for name in available_devices
+        )
     )
+    missing_devices = [
+        device for device in DEVICE_NAMES if device not in available_devices
+    ]
+    if missing_devices:
+        print("Device assenti nel file: " + ", ".join(missing_devices))
     print(f"Flag Coincident=1 nel file: {firmware_coincident}")
     print(
         f"Coincidenze temporali: {len(coincidences)} "
@@ -602,9 +613,11 @@ def print_summary(
 
 def _draw_possible_trajectories(
     ax: plt.Axes,
-    active_levels: list[int],
-    level_centres_cm: list[float],
-    tower_height_cm: float,
+    active_devices: set[str],
+    available_devices: tuple[str, ...],
+    centre_by_device_cm: dict[str, float],
+    plot_z_min: float,
+    plot_z_max: float,
 ) -> tuple[str, int]:
     """Disegna rette che colpiscono esattamente i rivelatori accesi.
 
@@ -612,17 +625,22 @@ def _draw_possible_trajectories(
     piano, non soltanto il suo centro. Le rette sono poi prolungate al di sopra
     e al di sotto della torre per rendere evidente da dove entrano e dove escono.
     """
+    active_levels = {DEVICE_NAMES.index(device) for device in active_devices}
     first_level = min(active_levels)
     last_level = max(active_levels)
-    if set(active_levels) != set(range(first_level, last_level + 1)):
+    inactive_between = {
+        device for device in available_devices
+        if first_level < DEVICE_NAMES.index(device) < last_level
+        and device not in active_devices
+    }
+    if inactive_between:
         return "hole", 0
 
-    z_lower = level_centres_cm[first_level]
-    z_upper = level_centres_cm[last_level]
+    lower_device = DEVICE_NAMES[first_level]
+    upper_device = DEVICE_NAMES[last_level]
+    z_lower = centre_by_device_cm[lower_device]
+    z_upper = centre_by_device_cm[upper_device]
     half_width = SCINTILLATOR_WIDTH_CM / 2
-    active_set = set(active_levels)
-    plot_z_min = -2.5
-    plot_z_max = tower_height_cm + 2.5
     segments = []
 
     # Campioniamo le due coordinate di attraversamento nei piani accesi estremi.
@@ -633,7 +651,8 @@ def _draw_possible_trajectories(
         for x_upper in endpoints:
             slope = (x_upper - x_lower) / (z_upper - z_lower)
             compatible = True
-            for level, centre_z in enumerate(level_centres_cm):
+            for device in available_devices:
+                centre_z = centre_by_device_cm[device]
                 detector_bottom = centre_z - SCINTILLATOR_THICKNESS_CM / 2
                 detector_top = centre_z + SCINTILLATOR_THICKNESS_CM / 2
                 x_bottom = x_lower + slope * (detector_bottom - z_lower)
@@ -643,7 +662,7 @@ def _draw_possible_trajectories(
                 intersects = (
                     line_max_x >= -half_width and line_min_x <= half_width
                 )
-                if intersects != (level in active_set):
+                if intersects != (device in active_devices):
                     compatible = False
                     break
             if compatible:
@@ -682,6 +701,7 @@ def draw_event(
     event_index: int,
     event_count: int,
     tower_height_cm: float,
+    available_devices: tuple[str, ...],
     normalizer: colors.Normalize,
     color_map,
 ) -> None:
@@ -692,17 +712,33 @@ def draw_event(
     pitch_cm = (
         tower_height_cm - SCINTILLATOR_THICKNESS_CM
     ) / (len(DEVICE_NAMES) - 1)
-    level_centres_cm = [
-        level * pitch_cm + SCINTILLATOR_THICKNESS_CM / 2
-        for level in range(len(DEVICE_NAMES))
-    ]
+    centre_by_device_cm = {
+        device: level * pitch_cm + SCINTILLATOR_THICKNESS_CM / 2
+        for level, device in enumerate(DEVICE_NAMES)
+    }
     hit_by_device = {hit.device: hit for hit in event.hits}
-    active_levels = [DEVICE_NAMES.index(hit.device) for hit in event.hits]
+    active_devices = set(hit_by_device)
+    visible_bottom_cm = min(
+        centre_by_device_cm[device] - SCINTILLATOR_THICKNESS_CM / 2
+        for device in available_devices
+    )
+    visible_top_cm = max(
+        centre_by_device_cm[device] + SCINTILLATOR_THICKNESS_CM / 2
+        for device in available_devices
+    )
+    plot_z_min = visible_bottom_cm - 2.5
+    plot_z_max = visible_top_cm + 2.5
     trajectory_status, trajectory_count = _draw_possible_trajectories(
-        ax, active_levels, level_centres_cm, tower_height_cm
+        ax,
+        active_devices,
+        available_devices,
+        centre_by_device_cm,
+        plot_z_min,
+        plot_z_max,
     )
 
-    for level, device in enumerate(DEVICE_NAMES):
+    for device in available_devices:
+        level = DEVICE_NAMES.index(device)
         z_cm = level * pitch_cm
         hit = hit_by_device.get(device)
         facecolor = color_map(normalizer(hit.sipm_mv)) if hit else "#e8edf2"
@@ -720,7 +756,7 @@ def draw_event(
         )
         ax.text(
             0,
-            level_centres_cm[level],
+            centre_by_device_cm[device],
             device,
             ha="center",
             va="center",
@@ -731,12 +767,13 @@ def draw_event(
         )
 
     ax.set_xlim(-4.2, 4.2)
-    ax.set_ylim(-2.5, tower_height_cm + 2.5)
+    ax.set_ylim(plot_z_min, plot_z_max)
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("x [cm]")
     ax.set_ylabel("z [cm]")
     ax.set_xticks([-3, 0, 3])
-    ax.set_yticks(np.arange(0, tower_height_cm + 0.1, 5.0))
+    first_tick = np.ceil(visible_bottom_cm / 5.0) * 5.0
+    ax.set_yticks(np.arange(first_tick, visible_top_cm + 0.1, 5.0))
     ax.grid(color="#d8dde1", linewidth=0.55, alpha=0.65)
     ax.set_axisbelow(True)
     ax.set_title("Vista laterale della torre", fontsize=12, pad=10)
@@ -773,15 +810,21 @@ def draw_event(
         y_position -= 0.047
 
     gap_cm = pitch_cm - SCINTILLATOR_THICKNESS_CM
+    missing_devices = tuple(
+        device for device in DEVICE_NAMES if device not in available_devices
+    )
+    missing_text = ", ".join(missing_devices) if missing_devices else "nessuno"
     info_ax.text(
         0.0, 0.27,
         "GEOMETRIA\n"
         f"Torre: {tower_height_cm:g} cm\n"
+        f"Moduli presenti: {len(available_devices)}/{len(DEVICE_NAMES)}\n"
+        f"Moduli assenti: {missing_text}\n"
         f"Scintillatore: {SCINTILLATOR_WIDTH_CM:g} × "
         f"{SCINTILLATOR_DEPTH_CM:g} × {SCINTILLATOR_THICKNESS_CM:g} cm³\n"
-        f"Gap calcolato: {gap_cm:.3f} cm",
+        f"Gap nominale: {gap_cm:.3f} cm",
         transform=info_ax.transAxes, ha="left", va="top",
-        fontsize=9.5, linespacing=1.45, color="#46545d",
+        fontsize=9.0, linespacing=1.35, color="#46545d",
     )
     if trajectory_status == "drawn":
         trajectory_note = (
@@ -815,6 +858,7 @@ def show_events(
     coincidences: list[Coincidence],
     initial_event: int,
     tower_height_cm: float,
+    available_devices: tuple[str, ...],
     save_path: Path | None,
     show: bool,
 ) -> None:
@@ -824,6 +868,8 @@ def show_events(
         raise ValueError(
             f"--event deve essere compreso tra 1 e {len(coincidences)}"
         )
+    if len(available_devices) < 2:
+        raise ValueError("servono almeno due device presenti per l'event display")
     minimum_height = len(DEVICE_NAMES) * SCINTILLATOR_THICKNESS_CM
     if tower_height_cm < minimum_height:
         raise ValueError(
@@ -862,6 +908,7 @@ def show_events(
             state["index"],
             len(coincidences),
             tower_height_cm,
+            available_devices,
             normalizer,
             color_map,
         )
@@ -898,7 +945,7 @@ def show_events(
 
 
 def parse_arguments() -> argparse.Namespace:
-    default_input = Path(__file__).with_name("coincidence_nine.txt")
+    default_input = Path(__file__).resolve().parents[1] / "Data" / "coincidence_nine.txt"
     parser = argparse.ArgumentParser(
         description="Ricostruisce coincidenze temporali e mostra la torre 2D."
     )
@@ -944,6 +991,10 @@ def main() -> int:
         display_hits = [
             hit for hit in all_hits if hit.sipm_mv >= args.min_sipm_mv
         ]
+        devices_in_file = {hit.device for hit in all_hits}
+        available_devices = tuple(
+            device for device in DEVICE_NAMES if device in devices_in_file
+        )
         # Le efficienze costruiscono gruppi dedicati usando soltanto i rispettivi
         # riferimenti. L'event display ottimizza direttamente alla molteplicità
         # richiesta, evitando che gruppi più piccoli ne consumino gli hit.
@@ -972,6 +1023,7 @@ def main() -> int:
             coincidences,
             initial_event=args.event - 1,
             tower_height_cm=args.tower_height_cm,
+            available_devices=available_devices,
             save_path=args.save,
             show=not args.no_show,
         )

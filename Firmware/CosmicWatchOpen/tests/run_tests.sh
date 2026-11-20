@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Host tests of the hardware-independent code and of the data format against
-# the parsers used by Data/import_data.py and GUI/GUI.py.
+# the parsers used by analysis_code/import_data.py and GUI/GUI.py.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$(mktemp -d)"

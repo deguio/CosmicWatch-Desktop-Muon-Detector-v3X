@@ -10,4 +10,7 @@ void oled_clear(void);
 void oled_text(int line, int x, const char *s);
 void oled_invert_line(int line);
 bool oled_flush(void);
+// Send one of the 8 pages (rows of 8 pixels): ~3 ms on the I2C bus instead of
+// ~25 ms for the whole frame, so the caller can serve events in between.
+bool oled_flush_page(int page);
 void oled_power(bool on);

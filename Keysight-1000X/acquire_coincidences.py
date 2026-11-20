@@ -63,7 +63,7 @@ def parse_args(argv=None):
                         help='Run directory; an existing run is resumed without overwriting events')
     connection = parser.add_mutually_exclusive_group()
     connection.add_argument('--usb', action='store_true', help='Use the first Keysight oscilloscope found on USB')
-    connection.add_argument('--resource', help='Explicit VISA resource, e.g. USB0::10893::903::<serial>::0::INSTR or TCPIP::192.168.1.20::INSTR')
+    connection.add_argument('--resource', help='Explicit VISA resource, e.g. USB0::10893::903::<serial>::0::INSTR or TCPIP::<IP>::INSTR')
     connection.add_argument('--ssh-bastion', help='SSH destination (user@host or ~/.ssh/config alias) to tunnel the SCPI socket through')
     parser.add_argument('--host', help='Oscilloscope IP/hostname: VXI-11 directly, or as seen from the bastion')
     parser.add_argument('--instrument-port', type=int, default=5025, help='SCPI socket port for --ssh-bastion (default: 5025)')

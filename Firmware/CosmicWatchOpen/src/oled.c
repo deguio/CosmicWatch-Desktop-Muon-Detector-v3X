@@ -78,6 +78,16 @@ bool oled_flush(void) {
     return i2c_write_timeout_us(I2C_PORT, OLED_ADDR, fb, sizeof fb, false, 100000) == (int)sizeof fb;
 }
 
+bool oled_flush_page(int page) {
+    if (!present || page < 0 || page >= PAGES) return false;
+    uint8_t win[] = {0x21, 0, W - 1, 0x22, (uint8_t)page, (uint8_t)page};
+    if (!cmds(win, sizeof win)) return false;
+    uint8_t buf[1 + W];
+    buf[0] = 0x40;
+    memcpy(buf + 1, fb + 1 + page * W, W);
+    return i2c_write_timeout_us(I2C_PORT, OLED_ADDR, buf, sizeof buf, false, 20000) == (int)sizeof buf;
+}
+
 void oled_power(bool on) {
     uint8_t c = on ? 0xAF : 0xAE;
     if (present) cmds(&c, 1);

@@ -1,12 +1,16 @@
+Questa cartella contiene solo dati e risultati. In git ci sono solo:
+  ExampleData/        file di esempio dell'autore originale
+  TestData/           estratti piccoli per provare gli script (vedi TestData/README.md)
+  showers_analysis/   documentazione, figure e posizioni dell'analisi sciami
+  pressure_analysis/  notebook degli studenti (senza dati)
 
-import_data.py
-This python script will allow you to record data from your detector to the computer.
-The benefit is that each event is additionally given a time stamp from your computer.
+Gli script di acquisizione e analisi stanno in ../analysis_code/:
+  import_data.py      acquisizione via USB da uno o più rivelatori
+  plot.py             analisi di un file (rate, spettri, coincidenze, sensori)
+  display.py          event display e efficienze della torre impilata
+  shower_analysis.py  ricerca di sciami con rivelatori affiancati
+Istruzioni complete in ../analysis_code/README.md.
 
-Running it requires one library:
-	1. pyserial (used to read data through the serial port)	
-
-After installing library, simply plug the detector into a USB port, run import_data.py
->> python import_data.py
-python script, and you will be prompted you to select the serial port you want to record data from.
-
+Acquisizione rapida (venv attivo, rivelatori collegati via USB):
+  python ../analysis_code/import_data.py
+Il file viene scritto nella cartella da cui si lancia il comando.

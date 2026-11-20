@@ -1,0 +1,36 @@
+# Pacchetti Python per acquisizione e analisi CosmicWatch v3X.
+# Installazione, dentro il venv del progetto:
+#     python -m pip install -r requirements.txt
+#
+# Provato con Python 3.13.5 e le versioni indicate nei commenti a destra
+# (prova completa: bash analysis_code/run_smoke_tests.sh). I limiti minimi
+# sono indicativi: non sono stati provati con versioni più vecchie, tranne
+# RsInstrument, per cui copyFileToPc.py richiede almeno la 1.53.
+
+# --- Analisi (analysis_code/, notebook) ---------------------------------------
+numpy>=1.24                 # provato 2.5.2
+scipy>=1.10                 # provato 1.18.1
+pandas>=2.0                 # provato 3.1.1
+matplotlib>=3.7             # provato 3.11.1
+
+# --- Acquisizione dai CosmicWatch via USB (analysis_code/import_data.py, GUI) --
+pyserial>=3.5               # provato 3.5
+
+# --- Oscilloscopio Keysight (Keysight-1000X/acquire_coincidences.py) -----------
+PyVISA>=1.13                # provato 1.16.2
+PyVISA-py>=0.7              # provato 0.8.1  (backend '@py', senza VISA del produttore)
+pyusb>=1.2                  # provato 1.3.1  (USBTMC via libusb)
+libusb-package>=1.0.26      # provato 1.0.30.0 (libreria libusb inclusa nel pacchetto)
+
+# --- Oscilloscopio RTO6 (RTO6/copyFileToPc.py) ----------------------------------
+RsInstrument>=1.53          # provato 1.131.0
+
+# --- Notebook degli studenti (Data/pressure_analysis/) -------------------------
+ipykernel>=6.0              # provato 7.4.0  (kernel per Jupyter o VS Code)
+
+# --- GUI dell'autore originale (GUI/GUI.py; vedi anche GUI/install.sh) ---------
+PyQt5>=5.15                 # provato 5.15.11
+pyqtgraph>=0.13             # provato 0.14.0
+numpy-stl>=3.0              # provato 4.0.0
+Pillow>=9.0                 # provato 12.3.0
+PyOpenGL>=3.1               # provato 3.1.10
