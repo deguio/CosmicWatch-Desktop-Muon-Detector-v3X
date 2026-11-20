@@ -3,7 +3,7 @@
 `acquire_coincidences.py` arma l'oscilloscopio in single, aspetta il trigger,
 legge in binario C1 e C2 della stessa acquisizione e salva un file per evento
 nel formato CSV dell'export Keysight (`x-axis,1,2` / `second,Volt,Volt`).
-`analyze_pulses.py` legge questi file senza conversioni. Il ciclo si ripete
+`analyze_pulses.py` (in [`../analysis_code/`](../analysis_code/), condiviso con RTO6) legge questi file senza conversioni. Il ciclo si ripete
 finché non si interrompe con Ctrl-C, oppure al raggiungimento di `--max-events`
 o `--duration-h`.
 
@@ -101,7 +101,7 @@ python acquire_coincidences.py --usb -o run_3m --check
 
 ```bash
 python acquire_coincidences.py --usb -o test_vicini --max-events 5
-python analyze_pulses.py test_vicini/scope_000000.csv --show
+python ../analysis_code/analyze_pulses.py test_vicini/scope_000000.csv --show
 ```
 
 **3. Presa dati a 3 m**, in una cartella dedicata:
@@ -191,7 +191,7 @@ sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.ta
 ## Analisi
 
 ```bash
-python analyze_pulses.py run_3m --distance-m 3 --offset-ns <offset calibrato> --min-amplitude-mv 10 --max-amplitude-mv 130
+python ../analysis_code/analyze_pulses.py run_3m --distance-m 3 --offset-ns <offset calibrato> --min-amplitude-mv 10 --max-amplitude-mv 130
 ```
 
 Per i file prodotti da questo script, il grafico del rate usa l'ora del PC
@@ -236,7 +236,7 @@ del record arriva a +6 ns, dentro il fronte di salita. Lo script calcola le ampi
 (`--baseline-end-ns`); nell'analisi usare lo stesso accorgimento:
 
 ```bash
-python analyze_pulses.py prova_usb --distance-m 3 --offset-ns 0 --baseline-end-ns -15
+python ../analysis_code/analyze_pulses.py prova_usb --distance-m 3 --offset-ns 0 --baseline-end-ns -15
 ```
 
 Gli eventi 0–2 di `prova_usb` hanno in `events.csv` ampiezze registrate con la

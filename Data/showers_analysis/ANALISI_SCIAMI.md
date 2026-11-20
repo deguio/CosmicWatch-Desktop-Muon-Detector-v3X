@@ -4,13 +4,14 @@ Analisi delle prese `CW_seven_parallel.txt` (13–14/11/2026, 21.4 h) e
 `CW_seven_parallel_2.txt` (19/11/2026, 4.9 h): in totale **26.3 h** con 7
 rivelatori sullo stesso tavolo, non impilati, letti insieme dal PC.
 
-Codice: [`../shower_analysis.py`](../shower_analysis.py). Posizioni:
+Codice: [`analysis_code/shower_analysis.py`](../../analysis_code/shower_analysis.py). Posizioni:
 [`positions_IMG_6986.txt`](positions_IMG_6986.txt). Figure: [`Figures/`](Figures/).
 
 ```bash
-cd Data
-python shower_analysis.py showers_analysis/CW_seven_parallel.txt showers_analysis/CW_seven_parallel_2.txt \
-    --positions showers_analysis/positions_IMG_6986.txt
+# dalla radice del repository
+python analysis_code/shower_analysis.py \
+    Data/showers_analysis/CW_seven_parallel.txt Data/showers_analysis/CW_seven_parallel_2.txt \
+    --positions Data/showers_analysis/positions_IMG_6986.txt
 ```
 
 Il programma impiega circa 30 s.

@@ -32,9 +32,10 @@ Poi:
      posizioni si confronta comunque l'eccesso per coppia con un modello
      fattorizzato a_i·a_j (differenze di efficienza fra rivelatori).
 
-Uso (dalla cartella Data, venv attivo):
-    python shower_analysis.py showers_analysis/CW_seven_parallel.txt showers_analysis/CW_seven_parallel_2.txt \
-        --positions showers_analysis/positions_IMG_6986.txt
+Uso (dalla radice del repository, venv attivo):
+    python analysis_code/shower_analysis.py \
+        Data/showers_analysis/CW_seven_parallel.txt Data/showers_analysis/CW_seven_parallel_2.txt \
+        --positions Data/showers_analysis/positions_IMG_6986.txt
 """
 
 from __future__ import annotations

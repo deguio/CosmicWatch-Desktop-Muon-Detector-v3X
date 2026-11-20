@@ -2,6 +2,7 @@
 """Offline tests of acquire_coincidences.py against a scripted InfiniiVision SCPI model."""
 
 import csv
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -12,6 +13,9 @@ import numpy as np
 import pyvisa
 
 import acquire_coincidences as acq
+
+# analyze_pulses.py è condiviso con RTO6 e sta in analysis_code/.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'analysis_code'))
 from analyze_pulses import amplitude_selection, expand_inputs, load_waveform, read_event_timestamp
 
 

@@ -1,13 +1,13 @@
 # Analisi offline delle pulse shape RTO6
 
-`analyze_pulses.py` legge la coppia di file `.csv` (metadati) e `.Wfm.csv`
+`analyze_pulses.py` (in [`../analysis_code/`](../analysis_code/), condiviso con il Keysight) legge la coppia di file `.csv` (metadati) e `.Wfm.csv`
 (campioni) e analizza due canali della stessa acquisizione. Non comunica con
 l'oscilloscopio. Richiede numpy, scipy e matplotlib, già presenti nel venv.
 
 Dalla cartella `RTO6`, con il venv attivo:
 
 ```bash
-python analyze_pulses.py RefCurve_2026-09-21_45_175205.csv --offset-ns 16 --show
+python ../analysis_code/analyze_pulses.py RefCurve_2026-09-21_45_175205.csv --offset-ns 16 --show
 ```
 
 Con `--show` apre due figure separate: un riepilogo compatto (1320×825 pixel)
@@ -22,9 +22,9 @@ cartella `timing_results`.
 Opzioni utili:
 
 ```bash
-python analyze_pulses.py RefCurve_2026-09-21_45_175205.csv --offset-ns 16 --fraction 0.3 --output-dir timing_f30
-python analyze_pulses.py RefCurve_2026-09-21_45_175205.csv --offset-ns 16 --smooth-samples 1 --output-dir timing_raw
-python analyze_pulses.py RefCurve_2026-09-21_45_175205.csv --offset-ns 16 --baseline-end-ns -100 --fit-range-ns -150 300 --output-dir timing_short
+python ../analysis_code/analyze_pulses.py RefCurve_2026-09-21_45_175205.csv --offset-ns 16 --fraction 0.3 --output-dir timing_f30
+python ../analysis_code/analyze_pulses.py RefCurve_2026-09-21_45_175205.csv --offset-ns 16 --smooth-samples 1 --output-dir timing_raw
+python ../analysis_code/analyze_pulses.py RefCurve_2026-09-21_45_175205.csv --offset-ns 16 --baseline-end-ns -100 --fit-range-ns -150 300 --output-dir timing_short
 ```
 
 La finestra di fit deve includere almeno 20 campioni di fondo e l'impulso.
@@ -152,6 +152,7 @@ sui residui correlati devono essere considerate insieme al χ².
 ## Verifiche
 
 ```bash
+cd ../analysis_code
 python -m unittest -v test_analyze_pulses.py
 ```
 
@@ -171,13 +172,13 @@ di impulsi simultanei; non si tratta di cercare più impulsi nello stesso record
 Dalla cartella RTO6, per i tre eventi 45, 46 e 47:
 
 ```bash
-python analyze_pulses.py 'RefCurve_2026-09-21_4[567]*.csv' --distance-m 2 --offset-ns 16 --show
+python ../analysis_code/analyze_pulses.py 'RefCurve_2026-09-21_4[567]*.csv' --distance-m 2 --offset-ns 16 --show
 ```
 
 Oppure, per tutti gli export RTO presenti nella cartella corrente:
 
 ```bash
-python analyze_pulses.py . --distance-m 2 --offset-ns 16
+python ../analysis_code/analyze_pulses.py . --distance-m 2 --offset-ns 16
 ```
 
 I valori 2 m e 16 ns sono argomenti di questi esempi: non sono default.
@@ -194,7 +195,7 @@ Il summary usa di default il constant fraction alla frazione selezionata.
 Per usare invece la differenza dei t0 fitted:
 
 ```bash
-python analyze_pulses.py 'RefCurve_2026-09-21_4[567]*.csv' --distance-m 2 --offset-ns 16 --summary-method causal
+python ../analysis_code/analyze_pulses.py 'RefCurve_2026-09-21_4[567]*.csv' --distance-m 2 --offset-ns 16 --summary-method causal
 ```
 
 `--summary-method gaussian` usa il fit della pulse shape convoluto. Questa
@@ -262,7 +263,7 @@ fit gaussiano e gestione di velocità >c, tempi nulli, segni discordi ed errori.
 ## Soglia minima sul picco di entrambi i canali
 
 ```bash
-python analyze_pulses.py '16ps/RefCurve_2026-09-21_*.csv' --distance-m 1.9 --offset-ns 16 --summary-method causal --min-amplitude-mv 20 --output-dir 16ps/timing_min20 --show
+python ../analysis_code/analyze_pulses.py '16ps/RefCurve_2026-09-21_*.csv' --distance-m 1.9 --offset-ns 16 --summary-method causal --min-amplitude-mv 20 --output-dir 16ps/timing_min20 --show
 ```
 
 `--min-amplitude-mv 20` richiede che **entrambi** i canali abbiano un picco di
@@ -306,7 +307,7 @@ campioni originali, in valore assoluto rispetto alla baseline di ciascun canale.
 Può essere usato da solo o insieme al minimo:
 
 ```bash
-python analyze_pulses.py '16ps/RefCurve_2026-09-21_*.csv' --distance-m 1.9 --offset-ns 16 --summary-method causal --min-amplitude-mv 20 --max-amplitude-mv 100 --output-dir 16ps/timing_20_100 --show
+python ../analysis_code/analyze_pulses.py '16ps/RefCurve_2026-09-21_*.csv' --distance-m 1.9 --offset-ns 16 --summary-method causal --min-amplitude-mv 20 --max-amplitude-mv 100 --output-dir 16ps/timing_20_100 --show
 ```
 
 In questo esempio entrambi i picchi devono essere nell'intervallo inclusivo
@@ -351,5 +352,5 @@ I file di altri formati già presenti nella cartella non vengono cancellati
 né aggiornati.
 
 ```bash
-python analyze_pulses.py '16ps/RefCurve_2026-09-2*' --offset-ns 15.69 --distance-m 1.87 --min-amplitude-mv 25 --max-amplitude-mv 170 --fraction 0.3 --summary-method causal --plot-formats png --show
+python ../analysis_code/analyze_pulses.py '16ps/RefCurve_2026-09-2*' --offset-ns 15.69 --distance-m 1.87 --min-amplitude-mv 25 --max-amplitude-mv 170 --fraction 0.3 --summary-method causal --plot-formats png --show
 ```

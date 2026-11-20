@@ -945,7 +945,7 @@ def show_events(
 
 
 def parse_arguments() -> argparse.Namespace:
-    default_input = Path(__file__).with_name("coincidence_nine.txt")
+    default_input = Path(__file__).resolve().parents[1] / "Data" / "coincidence_nine.txt"
     parser = argparse.ArgumentParser(
         description="Ricostruisce coincidenze temporali e mostra la torre 2D."
     )

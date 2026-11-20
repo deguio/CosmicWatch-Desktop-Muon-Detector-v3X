@@ -1,4 +1,4 @@
-"""Feed firmware USB lines to the real parser of Data/import_data.py.
+"""Feed firmware USB lines to the real parser of analysis_code/import_data.py.
 
 import_data.py runs its acquisition at import time, so only its pure helper
 functions are extracted (via ast) and executed here.
@@ -8,7 +8,7 @@ import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-src = (ROOT / 'Data' / 'import_data.py').read_text()
+src = (ROOT / 'analysis_code' / 'import_data.py').read_text()
 wanted = {'current_time_ns', 'format_pc_timestamp', 'build_output_row', 'output_header'}
 tree = ast.parse(src)
 module = ast.Module(

@@ -3,7 +3,7 @@
 Firmware scritto da zero a partire dallo schema elettrico (manuale, Fig. B.2, e
 `PCB/Circuit_Diagram.pdf`) e dalla descrizione del funzionamento nei documenti del
 progetto. Sostituisce `CosmicWatch_v3X.1.1.52.uf2` mantenendo lo stesso formato
-dei dati: `import_data.py`, la GUI e gli script in `Data/` funzionano senza modifiche.
+dei dati: `import_data.py`, la GUI e gli script in `analysis_code/` funzionano senza modifiche.
 
 La logica del firmware è descritta in dettaglio in [FIRMWARE.md](FIRMWARE.md); il piano
 di verifica e calibrazione è in [PIANO_MISURE.md](PIANO_MISURE.md); i punti aperti dopo il
