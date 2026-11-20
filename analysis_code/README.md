@@ -196,11 +196,13 @@ alto. Ricostruisce le coincidenze con l'ora del PC e:
 
 ```bash
 python analysis_code/display.py                      # default: Data/coincidence_nine.txt
+python analysis_code/display.py -w 5 --no-show                # finestra adatta a coincidence_nine (sez. 3.2)
 python analysis_code/display.py Data/coincidence_sette.txt --window-ms 1 --min-devices 3
 python analysis_code/display.py --event 12 --save evento_12.png --no-show
 ```
 
-Opzioni: `-w` finestra in ms (default 1), `-m` molteplicità minima,
+Opzioni: `-w` finestra in ms (default 1; va scelta più larga del jitter dell'ora
+del PC, vedi sez. 3.2), `-m` molteplicità minima,
 `--min-sipm-mv` soglia per i piani di riferimento, `--tower-height-cm`
 (default 38.5), `-e` evento iniziale.
 
@@ -264,7 +266,7 @@ sottocartella `esperienzeTracceCosmo/` (non in git), indicata da
 | sciami con 7 rivelatori affiancati | 26.3 h, firmware originale | 38 eventi con ≥3 rivelatori contro 0.35 casuali; rate ~3× il modello; doppie con componente locale | [`ANALISI_SCIAMI.md`](../Data/showers_analysis/ANALISI_SCIAMI.md) |
 | coefficiente barometrico | coppia in coincidenza, ~14 giorni | β = −0.178 ± 0.040 %/hPa (documentazione CosmicWatch: −0.141 ± 0.007) | notebook `13novembre.ipynb` |
 | superficie contro metropolitana | coppia in coincidenza hardware | 13.65 ± 0.11 /min contro 2.73 ± 0.18 /min: rapporto 0.200 ± 0.013 | sez. 3.1 |
-| efficienza dei piani della torre | 9 rivelatori impilati, 1.2 h | 55–75% (sandwich a 3), 40–57% (a 5), con grandi correzioni per gli accidentali | sez. 3.2 |
+| efficienza dei piani della torre | 9 rivelatori impilati, 1.2 h | 91–98% ± 2–3% (sandwich a 5, finestra 5 ms) | sez. 3.2 |
 | tempo di volo con RTO6 | 1.87 m, 78 eventi | ΔT = 5.99 ± 0.10 ns contro 6.24 ns attesi a c | [`../RTO6/README.md`](../RTO6/README.md) |
 | tempo di volo con Keysight | 3 m, 147 eventi | ΔT = 10.30 ± 0.09 ns contro 10.01 ns attesi a c (offset non calibrato) | [`../Keysight-1000X/README.md`](../Keysight-1000X/README.md) |
 
@@ -291,26 +293,69 @@ OTTO (sotto), 20.4 h; in metropolitana QUATTRO e TRE, 1.36 h.
 
 ### 3.2 Efficienza dei piani della torre
 
-`display.py` su `Data/coincidence_nine.txt` (9 rivelatori, firmware
-originale, 1.19 h, finestra di 1 ms sul tempo del PC):
+`display.py` su `Data/coincidence_nine.txt`: 9 rivelatori impilati, firmware
+originale, 1.19 h, 11 settembre 2026. Il metodo è descritto nella sez. 2.4.
 
-| piano | sandwich a 3 | sandwich a 5 |
-|---|---|---|
-| DUE | 56.8 ± 4.7 % | — |
-| TRE | 60.3 ± 4.7 % | 57.2 ± 10.8 % |
-| QUATTRO | 58.3 ± 5.5 % | 43.8 ± 12.4 % |
-| CINQUE | 65.7 ± 5.6 % | 42.2 ± 11.3 % |
-| SEI | 59.9 ± 5.1 % | 50.1 ± 13.4 % |
-| SETTE | 55.0 ± 4.8 % | 40.0 ± 11.0 % |
-| OTTO | 74.5 ± 5.8 % | — |
+**Scegliere la finestra.** In questa presa l'ora del PC è meno precisa che
+nelle prese successive: è stata acquisita prima del commit `fad4f25` (14/09),
+che assegna l'ora all'arrivo del primo byte di ogni riga. Il picco delle
+coincidenze vere fra piani adiacenti ha queste code:
 
-Le efficienze sono più basse di quanto ci si aspetta per uno scintillatore
-attraversato da un muone. Nel sandwich a 3 circa metà delle coppie di
-riferimento sono casuali (per esempio B2 = 254 su N2 = 513 per DUE), quindi il
-risultato dipende molto dalla sottrazione. **Da riprendere** con
-l'allineamento dei clock di `shower_analysis.py`, che permette finestre di
-~300 µs col firmware originale e di pochi µs col firmware open, e con una presa
-dati più lunga.
+| entro \|Δt\| | 0.5 ms | 1 ms | 2 ms | 3 ms |
+|---|---|---|---|---|
+| frazione delle coppie vere | 53% | 77% | 95% | 99% |
+
+Con la finestra di default di 1 ms si perde quindi una parte dei muoni veri. Il
+piano centrale sembra "mancare" il muone e l'efficienza esce sottostimata,
+40–60%. Allargando la finestra l'efficienza misurata col sandwich a 5 sale e
+poi si stabilizza:
+
+| piano | 1 ms | 2 ms | 3 ms | **5 ms** | 10 ms |
+|---|---|---|---|---|---|
+| TRE | 57 ± 11 % | 83 ± 5 % | 90 ± 3 % | **94 ± 3 %** | 92 ± 4 % |
+| QUATTRO | 44 ± 12 % | 89 ± 4 % | 89 ± 4 % | **93 ± 3 %** | 93 ± 5 % |
+| CINQUE | 42 ± 11 % | 82 ± 5 % | 92 ± 3 % | **96 ± 2 %** | 92 ± 4 % |
+| SEI | 50 ± 13 % | 86 ± 4 % | 95 ± 2 % | **98 ± 2 %** | 89 ± 4 % |
+| SETTE | 40 ± 11 % | 68 ± 5 % | 82 ± 4 % | **91 ± 3 %** | 88 ± 4 % |
+| quadruple di riferimento (N4) | ~20 | ~65 | ~90 | ~110 | ~140 |
+| quadruple casuali attese (B4) | 0.02 | 0.15 | 0.5 | 2.5 | 20 |
+
+- **Fino a 5 ms** il numero di quadruple di riferimento cresce perché si
+  recuperano muoni veri.
+- **Oltre 5 ms** cresce solo per le coincidenze casuali, e l'efficienza
+  corretta resta compatibile.
+- **Valore da usare: W = 5 ms**, cioè efficienze del **91–98%** con ±2–3% di
+  errore statistico. Sono i valori tipici di uno scintillatore attraversato da
+  un muone.
+
+```bash
+python analysis_code/display.py --no-show -w 5      # dati presi prima del 14/09/2026
+```
+
+**Quanto è affidabile il sandwich a 5.** Con W = 5 ms:
+
+- **Accidentali:** le quadruple casuali sono ~2% delle quadruple di
+  riferimento e vengono sottratte.
+- **Hit casuale nel centrale:** se il centrale non vede il muone, un suo hit
+  casuale può cadere nella finestra con probabilità ~6% (rate di ~6 Hz per
+  ~10 ms). L'efficienza risulta sovrastimata di (1 − ε) × 6%, cioè meno dello
+  0.5%.
+- **Errore statistico:** domina (~110 quadruple in 1.2 h).
+- **Allineamento:** il metodo assume piani allineati. Se un piano è spostato
+  lateralmente, una parte dei muoni passa fuori dal suo scintillatore e
+  l'efficienza risulta sottostimata.
+- **Copertura:** si misurano solo i cinque piani interni (TRE–SETTE).
+
+**Il sandwich a 3 qui non è affidabile.** Le coppie di riferimento casuali sono
+il 50% del totale con 1 ms e il 70% con 3 ms: il risultato dipende quasi solo
+dalla sottrazione, e con finestre larghe esce sopra il 100% (`display.py` lo
+segnala come "stima instabile").
+
+**Per le prossime prese:** l'`import_data.py` attuale ha un jitter di ~0.5 ms,
+e con l'allineamento dei clock di `shower_analysis.py` (funzione
+`align_clocks`) si scende a ~300 µs col firmware originale e a pochi µs col
+firmware open. Con finestre così strette anche il sandwich a 3 diventa
+utilizzabile.
 
 ---
 
