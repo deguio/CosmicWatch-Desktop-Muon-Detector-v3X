@@ -225,11 +225,21 @@ def clean_json(value):
     return value
 
 
+def save_plot(fig, prefix, args, **kwargs):
+    for extension in dict.fromkeys(getattr(args, 'plot_formats', ('png',))):
+        path = prefix.with_name(prefix.name + '.' + extension)
+        fig.savefig(path, **({'dpi': 110} if extension == 'png' else {}), **kwargs)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('inputs', nargs='+', help='One or more CSV files, directories, or quoted glob patterns')
+    parser.add_argument('--plot-formats', nargs='+', choices=('png', 'pdf'), default=['png'],
+                        help='Formats for all event and summary plots (default: png)')
     parser.add_argument('--rate-bin-hours', type=float, default=2.,
                         help='Time-bin width for rate summary in hours (default: 2)')
+    parser.add_argument('--summary-bins', type=int,
+                        help='Number of bins in velocity/time histograms (default: finer of Freedman-Diaconis and ceil(2*sqrt(N)))')
     parser.add_argument('--fraction', type=float, default=.2)
     parser.add_argument('--min-amplitude-mv', type=float,
                         help='Require BOTH raw peak magnitudes above their baselines to be >= this value in mV; default: no amplitude cut')
@@ -245,6 +255,8 @@ def parse_args():
     parser.add_argument('--summary-method', choices=['constant_fraction', 'causal', 'gaussian'],
                         default='constant_fraction', help='Timing estimator used for the batch velocity histogram')
     args = parser.parse_args()
+    if args.summary_bins is not None and args.summary_bins < 1:
+        parser.error('--summary-bins must be a positive integer.')
     if not np.isfinite(args.rate_bin_hours) or args.rate_bin_hours <= 0:
         parser.error('--rate-bin-hours must be finite and positive.')
     if args.min_amplitude_mv is not None and (not np.isfinite(args.min_amplitude_mv) or args.min_amplitude_mv < 0):
@@ -410,8 +422,7 @@ def analyze_event(args):
               borderaxespad=0, frameon=False, fontsize=7)
     ax.grid(alpha=.15)
     fig.suptitle(f'{stem} — timing analysis', fontsize=11)
-    fig.savefig(output / f'{stem}_timing.png', dpi=110)
-    fig.savefig(output / f'{stem}_timing.pdf')
+    save_plot(fig, output / f'{stem}_timing', args)
 
     # Separate oscilloscope-like view: raw voltages and common acquisition time axis.
     # The cable correction is used in timing calculations, not to move these traces.
@@ -439,8 +450,7 @@ def analyze_event(args):
     scope_ax.grid(which='minor', color='#506270', alpha=.2, ls=':')
     scope_ax.legend(loc='upper right', facecolor='#182631', edgecolor='#506270',
                     labelcolor='#e5edf4', fontsize=8)
-    scope.savefig(output / f'{stem}_scope.png', dpi=110, facecolor=scope.get_facecolor())
-    scope.savefig(output / f'{stem}_scope.pdf', facecolor=scope.get_facecolor())
+    save_plot(scope, output / f'{stem}_scope', args, facecolor=scope.get_facecolor())
     for method, result in deltas.items():
         print(f'{method}: deltaT = {result["delta_ns"]:.4f} ns')
         if 'corrected_delta_ns' in result:
@@ -597,7 +607,12 @@ def build_summary(reports, failures, args, output, rejected=None, defer_display=
         width = max(float(np.ptp(values)), abs(mean)*.02, .01)
         # Recompute after all selections; no fixed minimum/maximum bin count.
         # Equal-width bins are only a display choice; the fit is unbinned.
-        bin_count = int(np.ceil(np.sqrt(len(values))))
+        bin_count = getattr(args, 'summary_bins', None) or int(np.ceil(2*np.sqrt(len(values))))
+        if getattr(args, 'summary_bins', None) is None:
+            iqr = float(np.subtract(*np.percentile(values, [75, 25])))
+            fd_width = 2*iqr/len(values)**(1/3)
+            if fd_width > 0:
+                bin_count = max(bin_count, int(np.ceil((np.ptp(values)+.24*width)/fd_width)))
         ax.hist(values, bins=np.linspace(values.min()-width*.12, values.max()+width*.12,
                                         bin_count+1),
                 density=True, color='#6aaed6', edgecolor='white', alpha=.65,
@@ -634,8 +649,7 @@ def build_summary(reports, failures, args, output, rejected=None, defer_display=
                  + cut_label
                  + (' · PRELIMINARY: very small sample' if len(usable) < 10 else ''), fontsize=10)
     fig.supxlabel('Statistical errors only; distance/offset systematics excluded. Gaussian speed and Gaussian time are different models.', fontsize=8)
-    fig.savefig(prefix.with_suffix('.png'), dpi=110)
-    fig.savefig(prefix.with_suffix('.pdf'))
+    save_plot(fig, prefix, args)
     if args.show and not defer_display:
         plt.show()
     if not args.show or not defer_display:
@@ -770,8 +784,7 @@ def build_rate_summary(paths, args, output):
     fig.suptitle(f'Event rate over time · {args.rate_bin_hours:g} h bins · '
                  f'{missing} missing timestamps · {unknown} unknown selections', fontsize=11)
     fig.supxlabel('Elapsed-time rates, not live-time corrected; last bin normalized to its actual duration. Errors: √N.', fontsize=8)
-    fig.savefig(prefix.with_suffix('.png'), dpi=110)
-    fig.savefig(prefix.with_suffix('.pdf'))
+    save_plot(fig, prefix, args)
     if not args.show:
         plt.close(fig)
     print(f'Rate summary files: {prefix}')

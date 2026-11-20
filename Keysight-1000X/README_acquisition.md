@@ -55,15 +55,15 @@ Con Python dentro distrobox/toolbox, la regola udev va comunque sul sistema host
 LAN diretta (VXI-11), con il PC sulla stessa rete dell'oscilloscopio:
 
 ```bash
-python acquire_coincidences.py --host 192.168.1.20 -o run_3m --check
+python acquire_coincidences.py --host <IP-oscilloscopio> -o run_3m --check
 ```
 
 L'IP si legge sull'oscilloscopio in Utility → I/O. Altre risorse VISA si passano con
-`--resource`, per esempio `TCPIP::192.168.1.20::5025::SOCKET` o una risorsa `USB0::...::INSTR`.
+`--resource`, per esempio `TCPIP::<IP-oscilloscopio>::5025::SOCKET` o una risorsa `USB0::...::INSTR`.
 Attraverso il bastion SSH, come per l'RTO6, si usa il socket SCPI (porta 5025):
 
 ```bash
-python acquire_coincidences.py --ssh-bastion deguio@cerbero.mib.infn.it --host <IP oscilloscopio> -o run_3m --check
+python acquire_coincidences.py --ssh-bastion <utente>@<bastion> --host <IP oscilloscopio> -o run_3m --check
 ```
 
 Per una presa dati di giorni conviene un PC in laboratorio connesso direttamente.
@@ -118,7 +118,7 @@ periodicamente sul terminale e in `session_*.json`.
 ### Trigger alternativo: edge e coincidenza software
 
 ```bash
-python acquire_coincidences.py --host 192.168.1.20 -o run_3m_edge \
+python acquire_coincidences.py --host <IP-oscilloscopio> -o run_3m_edge \
     --trigger edge --edge-source 1 --trigger-level-mv 5 --min-amplitude-mv 5
 ```
 

@@ -16,3 +16,7 @@
 
 # Excel temp files
 ~.xlsx
+
+# Python bytecode
+__pycache__/
+*.pyc

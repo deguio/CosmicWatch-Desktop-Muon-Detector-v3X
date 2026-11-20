@@ -1,0 +1,17 @@
+# Posizioni dei 7 CosmicWatch stimate da IMG_6986.HEIC (centri dei punti rossi).
+# Pixel (4032x3024) -> cm con scale separate per asse, fissate dalle distanze
+# massime misurate: 230 cm in orizzontale (OTTO-TRE in x), 90 cm in verticale (QUATTRO-OTTO in y).
+#   x: 230 cm / 3718.3 px = 0.0619 cm/px ; y: 90 cm / 1231.8 px = 0.0731 cm/px
+# Le due scale differiscono del ~18% (prospettiva): incertezza sulle posizioni
+# intermedie di qualche cm.
+# x verso destra, y dal bordo del tavolo verso la parete (pixel y invertito).
+# Nomi dei rivelatori dalle etichette aggiunte su IMG_6986 (da sinistra a destra:
+# OTTO, AxLab, NOVE, CINQUE, QUATTRO, UNO, TRE).
+# label   x_cm    y_cm      (pixel x, pixel y)
+OTTO         0.0     0.0     #    63.4  1416.7
+AxLab       34.8    42.5     #   626.5   835.6
+NOVE        91.3    68.5     #  1539.5   478.8
+CINQUE     129.2    80.7     #  2152.7   311.7
+QUATTRO    182.6    90.0     #  3015.6   184.9
+UNO        200.1    48.9     #  3298.7   747.9
+TRE        230.0     7.7     #  3781.7  1311.0

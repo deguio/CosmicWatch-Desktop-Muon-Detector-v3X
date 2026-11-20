@@ -5,6 +5,8 @@
 import argparse
 import csv
 import os
+import re
+from datetime import datetime
 from contextlib import contextmanager
 from fnmatch import fnmatchcase
 from pathlib import Path, PureWindowsPath
@@ -70,6 +72,37 @@ def matching_files(rto, source):
     return sorted(set(matches), key=lambda path: path.name.casefold())
 
 
+def parse_time_bound(value):
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError('Use YYYY-MM-DD HH:MM[:SS], in the filename clock.')
+
+
+def filter_time_range(sources, since=None, until=None):
+    """Inclusive bounds on export filename time, not acquisition metadata time."""
+    if since is None and until is None:
+        return sources
+    selected = []
+    for item in sources:
+        match = re.fullmatch(r'RefCurve_(\d{4}-\d{2}-\d{2})_\d+_(\d{6})(?:\..+)?',
+                             item.name, re.IGNORECASE)
+        try:
+            if not match:
+                raise ValueError('unrecognized filename')
+            stamp = datetime.strptime(' '.join(match.groups()), '%Y-%m-%d %H%M%S')
+        except ValueError:
+            print(f'Skipping file with unknown export time: {item.name}', flush=True)
+            continue
+        if (since is None or stamp >= since) and (until is None or stamp <= until):
+            selected.append(item)
+    print(f'Time filter (export filename clock): {since or "unbounded"} to '
+          f'{until or "unbounded"}; {len(selected)}/{len(sources)} files selected', flush=True)
+    return selected
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Copy existing files from the RTO6 disk (no acquisition)."
@@ -87,13 +120,23 @@ def main():
     connection = parser.add_mutually_exclusive_group()
     connection.add_argument('--ssh-bastion', help='SSH destination: user@host or an alias in ~/.ssh/config')
     connection.add_argument('--resource', help='Explicit VISA resource, e.g. TCPIP::127.0.0.1::15025::SOCKET for a manual tunnel')
-    parser.add_argument('--instrument-host', default='193.206.156.231', help='Oscilloscope address reachable from the bastion (or directly on campus)')
+    parser.add_argument('--instrument-host', default=os.environ.get('RTO6_HOST'),
+                        help='Oscilloscope address reachable from the bastion (or directly on campus); '
+                             'default: environment variable RTO6_HOST')
     parser.add_argument('--instrument-port', type=int, default=5025, help='Remote SCPI socket port for SSH mode (default: 5025)')
     parser.add_argument('--local-port', type=int, default=15025, help='Loopback port for the SSH tunnel (default: 15025)')
     parser.add_argument('--timeout-ms', type=int, default=30000, help='Timeout for each VISA I/O operation, in milliseconds (default: 30000)')
+    parser.add_argument('--since', type=parse_time_bound,
+                        help='Inclusive start in export filename time: "YYYY-MM-DD HH:MM[:SS]"')
+    parser.add_argument('--until', type=parse_time_bound,
+                        help='Inclusive end in export filename time: "YYYY-MM-DD HH:MM[:SS]"')
     args = parser.parse_args()
+    if args.since is not None and args.until is not None and args.since > args.until:
+        parser.error('--since must not be later than --until.')
     if args.timeout_ms <= 0:
         parser.error('--timeout-ms must be positive.')
+    if not args.resource and not args.instrument_host:
+        parser.error('Give --instrument-host (or set RTO6_HOST) or --resource.')
     if not all(1 <= port <= 65535 for port in (args.local_port, args.instrument_port)):
         parser.error('TCP ports must be between 1 and 65535.')
     if args.ssh_bastion and (args.ssh_bastion.startswith('-') or any(c.isspace() for c in args.ssh_bastion)):
@@ -118,10 +161,12 @@ def main():
 
     RsInstrument.assert_minimum_version("1.53.0")
     with instrument_connection(args) as (resource, backend):
-        copy_files(resource, backend, source, wildcard, output, parser, args.timeout_ms)
+        copy_files(resource, backend, source, wildcard, output, parser, args.timeout_ms,
+                   args.since, args.until)
 
 
-def copy_files(resource, backend, source, wildcard, output, parser, timeout_ms=30000):
+def copy_files(resource, backend, source, wildcard, output, parser, timeout_ms=30000,
+               since=None, until=None):
     print(f'Connecting to {resource} ...', flush=True)
     rto = RsInstrument(resource, True, False,
                        options=f"SelectVisa={backend}, VisaTimeout={timeout_ms}")
@@ -137,6 +182,10 @@ def copy_files(resource, backend, source, wildcard, output, parser, timeout_ms=3
         if not sources:
             parser.error(f"No files match: {source}. Include the full name and extension, "
                          "or quote a prefix followed by *, e.g. -f 'RefCurve_2026-09-21_47*'.")
+        sources = filter_time_range(sources, since, until)
+        if not sources:
+            print('No files in the requested time range; nothing to copy.', flush=True)
+            return
         transfers = [
             (item, output / item.name if output.is_dir() else output)
             for item in sources
