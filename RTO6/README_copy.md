@@ -1,8 +1,12 @@
 # Copia dei file RTO6 via bastion SSH
 
-Eseguire dal terminale del Mac, con il venv attivo:
+Eseguire dal terminale del Mac, con il venv attivo. L'indirizzo
+dell'oscilloscopio (come lo vede il bastion) non è scritto nello script: va
+passato con `--instrument-host` o, una volta per sessione, con la variabile
+d'ambiente `RTO6_HOST`. Utente e bastion vanno sostituiti ai segnaposto.
 
 ```bash
+export RTO6_HOST=<IP-oscilloscopio>
 python copyFileToPc.py --ssh-bastion <utente>@<bastion> -f 'RefCurve_2026-09-21*' -o ~/Desktop
 ```
 

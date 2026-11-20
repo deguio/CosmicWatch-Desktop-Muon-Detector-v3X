@@ -43,7 +43,8 @@ questo tempo. Per misurarlo servono:
    più `RefCurve_*.Wfm.csv`.
 2. **Copia dei dati sul PC** (dalla cartella `RTO6`, venv attivo):
    ```bash
-   python copyFileToPc.py --ssh-bastion <utente>@<bastion> -f 'RefCurve_*' --since '2026-09-24 14:15' -o 0ps/
+   python copyFileToPc.py --ssh-bastion <utente>@<bastion> --instrument-host <IP-oscilloscopio> \
+       -f 'RefCurve_*' --since '2026-09-24 14:15' -o 0ps/
    ```
    Dettagli in [`README_copy.md`](README_copy.md).
 3. **Calibrazione:** stessa analisi con i rivelatori a contatto e offset zero.
@@ -72,10 +73,14 @@ modello è descritto in [`README_timing.md`](README_timing.md).
 | `0ps/` | 24/09, 15:07–15:36 | 4 cm (rivelatori a contatto) | 354 | 232 | 0.49 h |
 | `16ps/` | 21/09 18:45 – 24/09 08:51 | 1.87 m | 175 | 78 | 62.1 h |
 
-> **Da chiarire:** secondo le note di presa dati, i nomi delle cartelle si
-> riferiscono al ritardo dovuto alla diversa lunghezza dei cavi. Nei riepiloghi
-> dell'analisi, però, le due prese differiscono per la **distanza** (4 cm contro
-> 1.87 m), mentre il ritardo dei cavi (~15.7 ns) è presente in entrambe.
+In entrambe le prese i rivelatori sono allineati sulla verticale. **Nomi delle
+cartelle:** la loro logica originale non è stata annotata. Dai dati, `0ps`
+corrisponde ai rivelatori a contatto (calibrazione) e `16ps` alla presa a
+distanza; "16" richiama probabilmente il ritardo di ~16 ns del cavo di C2, che
+però è presente in entrambe le prese (il ΔT misurato a contatto è 15.7 ns).
+Nelle prossime edizioni conviene dare nomi espliciti, per esempio
+`calibrazione_4cm/` e `tof_187cm/`, e annotare cavi e distanze in un file di
+testo accanto ai dati.
 
 ## 4. Risultati
 

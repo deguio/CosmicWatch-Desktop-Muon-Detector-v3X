@@ -1,5 +1,8 @@
-Questa cartella contiene solo dati e risultati (in git solo ExampleData/ e la
-documentazione delle analisi, per esempio showers_analysis/ANALISI_SCIAMI.md).
+Questa cartella contiene solo dati e risultati. In git ci sono solo:
+  ExampleData/        file di esempio dell'autore originale
+  TestData/           estratti piccoli per provare gli script (vedi TestData/README.md)
+  showers_analysis/   documentazione, figure e posizioni dell'analisi sciami
+  pressure_analysis/  notebook degli studenti (senza dati)
 
 Gli script di acquisizione e analisi stanno in ../analysis_code/:
   import_data.py      acquisizione via USB da uno o più rivelatori

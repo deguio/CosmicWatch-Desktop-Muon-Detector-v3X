@@ -16,6 +16,7 @@ oscilloscopi sono descritte in [`../RTO6/README.md`](../RTO6/README.md) e
 | [`shower_analysis.py`](shower_analysis.py) | ricerca di sciami con rivelatori affiancati: allineamento dei clock, accidentali, modello |
 | [`analyze_pulses.py`](analyze_pulses.py) | analisi delle forme d'onda all'oscilloscopio (RTO6 e Keysight) e tempo di volo |
 | [`test_analyze_pulses.py`](test_analyze_pulses.py) | test di `analyze_pulses.py` |
+| [`run_smoke_tests.sh`](run_smoke_tests.sh) | prova rapida di tutti gli script sui dati di [`../Data/TestData/`](../Data/TestData/) |
 
 ---
 
@@ -245,9 +246,9 @@ python ../analysis_code/analyze_pulses.py '16ps/RefCurve_2026-09-2*' --offset-ns
 `13novembre.ipynb` e `13novembre_locale.ipynb`, scritti con gli studenti e poi
 rivisti. Spiegano passo passo come caricare un file CosmicWatch con pandas,
 selezionare le coincidenze, fare spettri e rate nel tempo, e misurare la
-**correlazione fra rate dei muoni e pressione atmosferica**. Il percorso dei
-dati (`percorso_cartella`) è scritto per esteso nella seconda cella e va
-adattato.
+**correlazione fra rate dei muoni e pressione atmosferica**. I dati vanno nella
+sottocartella `esperienzeTracceCosmo/` (non in git), indicata da
+`percorso_cartella` nella seconda cella.
 
 ---
 
@@ -309,6 +310,20 @@ dati più lunga.
 ---
 
 ## 4. Test
+
+**Prova rapida di tutta la catena** sui dati di
+[`../Data/TestData/`](../Data/TestData/): estratti di ~10 minuti o 10 eventi
+per ogni tipo di misura, ~11 MB.
+
+```bash
+bash analysis_code/run_smoke_tests.sh      # dalla radice del repository, venv attivo
+```
+
+Lancia ogni script sui dati di prova in una cartella temporanea, poi i test
+unitari, e stampa `OK` o `FAIL` per ogni passo. Va rilanciata dopo ogni
+modifica al codice.
+
+**Test unitari e del firmware**, uno per uno:
 
 ```bash
 cd analysis_code && python -m unittest -v test_analyze_pulses.py

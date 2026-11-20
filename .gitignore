@@ -20,3 +20,23 @@
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Dati: in git solo codice, documentazione e i dati di prova in Data/TestData
+Data/*
+!Data/README.txt
+!Data/ExampleData/
+Data/ExampleData/Figures/
+!Data/TestData/
+!Data/showers_analysis/
+Data/showers_analysis/*.txt
+!Data/showers_analysis/positions_*.txt
+Data/showers_analysis/*.HEIC
+!Data/pressure_analysis/
+Data/pressure_analysis/esperienzeTracceCosmo/
+GUI/Data/
+RTO6/0ps/
+RTO6/16ps/
+Keysight-1000X/run_*/
+Keysight-1000X/prova_*/
+Keysight-1000X/synthetic/
+.vscode/

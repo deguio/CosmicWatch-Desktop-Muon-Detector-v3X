@@ -439,10 +439,11 @@ def main():
         bkg = ((np.abs(v) > 1000) & (np.abs(v) < 3000)).sum() / 4000.0 * 2 * args.window_us
         e = (np.abs(v) <= args.window_us).sum() - bkg
         pair_exc[det_index[a], det_index[b]] = pair_exc[det_index[b], det_index[a]] = e
-        # errore: Poisson sul conteggio in finestra + fondo dalle bande (4000 µs)
+        # errore: Poisson sul conteggio in finestra (almeno 1, così una coppia senza
+        # conteggi non ha errore nullo) + fondo dalle bande (4000 µs)
         n_side = ((np.abs(v) > 1000) & (np.abs(v) < 3000)).sum()
         pair_err[det_index[a], det_index[b]] = pair_err[det_index[b], det_index[a]] = np.sqrt(
-            (np.abs(v) <= args.window_us).sum() + n_side * (2 * args.window_us / 4000.0) ** 2)
+            max((np.abs(v) <= args.window_us).sum(), 1) + n_side * (2 * args.window_us / 4000.0) ** 2)
     for i, a in enumerate(names):
         print('   %-8s ' % a + ' '.join('%6.1f' % pair_exc[i, j] if i != j else '     -'
                                          for j in range(n_det)))
